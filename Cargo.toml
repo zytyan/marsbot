@@ -4,10 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1"
 opencv = { version = "0.99.0", default-features = false, features = [
+    "imgcodecs",
     "imgproc",
 ] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "multipart"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 frankenstein = { version = "0.50", features = ["client-reqwest"] }
-reqwest = { version = "0.13", features = [] }
-tokio = "1"

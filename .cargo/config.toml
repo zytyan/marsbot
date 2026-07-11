@@ -1,0 +1,5 @@
+[env]
+OPENCV_LINK_LIBS = { value = "static=opencv_core,static=opencv_imgcodecs,static=opencv_imgproc,static=libjpeg-turbo", force = true }
+OPENCV_INCLUDE_PATHS = { value = "opencv_static/build/opencv-install/include/opencv4", relative = true, force = true }
+OPENCV_LINK_PATHS = { value = "opencv_static/build/opencv-install/lib", force = true, relative = true }
+SQLITE3_STATIC = "1"

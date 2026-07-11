@@ -1,0 +1,13 @@
+[package]
+name = "marsbot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+opencv = { version = "0.99.0", default-features = false, features = [
+    "imgproc",
+] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+frankenstein = { version = "0.50", features = ["client-reqwest"] }
+reqwest = { version = "0.13", features = [] }
+tokio = "1"

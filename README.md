@@ -52,6 +52,8 @@ cargo run --release
 | `LOG_LEVEL` | 否 | `INFO` | 日志级别 |
 | `REPORT_STAT_URL` | 否 | 无 | 重复图片统计上报地址 |
 | `ALLOW_BOT_MESSAGES` | 否 | `false` | 是否处理其他 Bot 的消息；始终忽略自身消息 |
+| `TOKIO_WORKER_THREADS` | 否 | `1` | Tokio 异步工作线程数，必须为正整数 |
+| `TOKIO_MAX_BLOCKING_THREADS` | 否 | `4` | Tokio `spawn_blocking` 最大线程数，同时作为 SQLite 连接池上限，必须为正整数 |
 
 ## 本地 Telegram Bot API
 

@@ -1,4 +1,7 @@
+mod db_pool;
+
 use anyhow::{Context, Result, anyhow};
+use db_pool::{PooledConnection, SqlitePool};
 use frankenstein::{
     AsyncTelegramApi, ParseMode,
     client_reqwest::Bot,
@@ -18,8 +21,7 @@ use opencv::{
     core::{self, MatTraitConst, Vector},
     imgcodecs, imgproc,
 };
-use r2d2::{ManageConnection, Pool, PooledConnection};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::{
     collections::HashMap,
     env,
@@ -40,7 +42,8 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 const SCHEMA_VERSION: i64 = 1;
 const GROUP_WAIT: Duration = Duration::from_millis(1500);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
-const DB_POOL_SIZE: u32 = 8;
+const DEFAULT_TOKIO_WORKER_THREADS: usize = 1;
+const DEFAULT_TOKIO_MAX_BLOCKING_THREADS: usize = 4;
 #[derive(Clone, Debug)]
 struct Config {
     token: String,
@@ -54,6 +57,8 @@ struct Config {
     log_level: String,
     report_stat_url: Option<String>,
     allow_bot_messages: bool,
+    tokio_worker_threads: usize,
+    tokio_max_blocking_threads: usize,
 }
 
 impl Config {
@@ -65,6 +70,16 @@ impl Config {
             .map(parse_bool)
             .transpose()?
             .unwrap_or(false);
+        let tokio_worker_threads = parse_thread_count(
+            "TOKIO_WORKER_THREADS",
+            get("TOKIO_WORKER_THREADS").as_deref(),
+            DEFAULT_TOKIO_WORKER_THREADS,
+        )?;
+        let tokio_max_blocking_threads = parse_thread_count(
+            "TOKIO_MAX_BLOCKING_THREADS",
+            get("TOKIO_MAX_BLOCKING_THREADS").as_deref(),
+            DEFAULT_TOKIO_MAX_BLOCKING_THREADS,
+        )?;
         let config = Self {
             token,
             api_prefix: get("BOT_API_URL").unwrap_or_else(|| "https://api.telegram.org/bot".into()),
@@ -80,6 +95,8 @@ impl Config {
             log_level: get("LOG_LEVEL").unwrap_or_else(|| "INFO".into()),
             report_stat_url: get("REPORT_STAT_URL"),
             allow_bot_messages,
+            tokio_worker_threads,
+            tokio_max_blocking_threads,
         };
         config.print();
         config.validate()?;
@@ -169,6 +186,18 @@ impl Config {
                 false,
                 "allow messages from other bots",
             ),
+            (
+                "TOKIO_WORKER_THREADS",
+                self.tokio_worker_threads.to_string(),
+                false,
+                "Tokio async worker thread count",
+            ),
+            (
+                "TOKIO_MAX_BLOCKING_THREADS",
+                self.tokio_max_blocking_threads.to_string(),
+                false,
+                "Tokio blocking thread and SQLite pool limit",
+            ),
         ];
         for (name, value, required, purpose) in rows {
             eprintln!("{name}: value={value}; required={required}; purpose={purpose}");
@@ -193,6 +222,19 @@ fn parse_bool(value: &str) -> Result<bool> {
         "0" | "false" | "no" | "off" => Ok(false),
         _ => Err(anyhow!("expected boolean, got {value:?}")),
     }
+}
+
+fn parse_thread_count(name: &str, value: Option<&str>, default: usize) -> Result<usize> {
+    let value = match value {
+        Some(value) => value
+            .parse::<usize>()
+            .with_context(|| format!("{name} must be a positive integer"))?,
+        None => default,
+    };
+    if value == 0 {
+        anyhow::bail!("{name} must be a positive integer");
+    }
+    Ok(value)
 }
 
 fn mask(value: &str) -> String {
@@ -228,41 +270,9 @@ fn http_client(config: &Config) -> Result<reqwest::Client> {
     builder.build().context("build HTTP client")
 }
 
-#[derive(Debug)]
-struct SqliteConnectionManager {
-    path: PathBuf,
-}
-
-impl ManageConnection for SqliteConnectionManager {
-    type Connection = Connection;
-    type Error = rusqlite::Error;
-
-    fn connect(&self) -> std::result::Result<Self::Connection, Self::Error> {
-        let conn = Connection::open_with_flags(
-            &self.path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
-        )?;
-        conn.busy_timeout(Duration::from_secs(10))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-80000;",
-        )?;
-        Ok(conn)
-    }
-
-    fn is_valid(&self, conn: &mut Self::Connection) -> std::result::Result<(), Self::Error> {
-        conn.execute_batch("SELECT 1")
-    }
-
-    fn has_broken(&self, _: &mut Self::Connection) -> bool {
-        false
-    }
-}
-
 #[derive(Clone)]
 struct Database {
-    pool: Pool<SqliteConnectionManager>,
+    pool: SqlitePool,
 }
 
 #[derive(Clone, Debug)]
@@ -280,32 +290,26 @@ struct Observation {
 }
 
 impl Database {
-    async fn open(path: PathBuf) -> Result<Self> {
-        spawn_blocking(move || -> Result<Self> {
-            let manager = SqliteConnectionManager { path };
-            let pool = Pool::builder()
-                .max_size(DB_POOL_SIZE)
-                .min_idle(Some(0))
-                .connection_timeout(Duration::from_secs(10))
-                .test_on_check_out(false)
-                .build(manager)
-                .context("create SQLite connection pool")?;
-            let db = Self { pool };
-            db.initialize()?;
-            Ok(db)
-        })
-        .await
-        .context("database initialization task")?
+    async fn open(path: PathBuf, pool_size: usize) -> Result<Self> {
+        let db = Self {
+            pool: SqlitePool::new(path, pool_size)?,
+        };
+        db.initialize().await?;
+        Ok(db)
     }
 
-    fn connection(&self) -> Result<PooledConnection<SqliteConnectionManager>> {
-        self.pool.get().context("get SQLite connection from pool")
+    async fn connection(&self) -> Result<PooledConnection> {
+        self.pool
+            .get()
+            .await
+            .context("get SQLite connection from pool")
     }
 
-    fn initialize(&self) -> Result<()> {
-        let conn = self.connection()?;
-        conn.execute_batch(
-            r#"
+    async fn initialize(&self) -> Result<()> {
+        let conn = self.connection().await?;
+        spawn_blocking(move || -> Result<()> {
+            conn.execute_batch(
+                r#"
                 CREATE TABLE IF NOT EXISTS mars_info (
                     group_id INTEGER NOT NULL,
                     pic_dhash BLOB NOT NULL,
@@ -336,59 +340,62 @@ impl Database {
                     value INTEGER NOT NULL
                 ) WITHOUT ROWID;
             "#,
-        )?;
-        let version: i64 = conn.query_row(
-            r#"
+            )?;
+            let version: i64 = conn.query_row(
+                r#"
                 SELECT COALESCE(
                     (SELECT value FROM mars_stat_meta WHERE key = 'schema_version'),
                     0
                 )
             "#,
-            [],
-            |r| r.get(0),
-        )?;
-        if version < SCHEMA_VERSION {
-            let tx = conn.unchecked_transaction()?;
-            tx.execute("DELETE FROM mars_group_stat", [])?;
-            tx.execute(
-                r#"
+                [],
+                |r| r.get(0),
+            )?;
+            if version < SCHEMA_VERSION {
+                let tx = conn.unchecked_transaction()?;
+                tx.execute("DELETE FROM mars_group_stat", [])?;
+                tx.execute(
+                    r#"
                     INSERT INTO mars_group_stat (group_id, image_count)
                     SELECT group_id, COUNT(*)
                     FROM mars_info
                     GROUP BY group_id
                 "#,
-                [],
-            )?;
-            let groups: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM mars_group_stat WHERE group_id < 0",
-                [],
-                |r| r.get(0),
-            )?;
-            tx.execute(
-                r#"
+                    [],
+                )?;
+                let groups: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM mars_group_stat WHERE group_id < 0",
+                    [],
+                    |r| r.get(0),
+                )?;
+                tx.execute(
+                    r#"
                     INSERT INTO mars_stat_meta (key, value)
                     VALUES ('group_count', ?)
                     ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 "#,
-                [groups],
-            )?;
-            tx.execute(
-                r#"
+                    [groups],
+                )?;
+                tx.execute(
+                    r#"
                     INSERT INTO mars_stat_meta (key, value)
                     VALUES ('schema_version', ?)
                     ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 "#,
-                [SCHEMA_VERSION],
-            )?;
-            tx.commit()?;
-        }
+                    [SCHEMA_VERSION],
+                )?;
+                tx.commit()?;
+            }
+            Ok(())
+        })
+        .await
+        .context("database initialization task")??;
         Ok(())
     }
 
     async fn hash_for_file(&self, fuid: String) -> Result<Option<[u8; 8]>> {
-        let db = self.clone();
+        let conn = self.connection().await?;
         spawn_blocking(move || {
-            let conn = db.connection()?;
             conn.query_row(
                 "SELECT dhash FROM fuid_to_dhash WHERE fuid=?",
                 [fuid],
@@ -402,9 +409,9 @@ impl Database {
     }
 
     async fn cache_file_hash(&self, fuid: String, hash: [u8; 8]) -> Result<()> {
-        let db = self.clone();
+        let conn = self.connection().await?;
         spawn_blocking(move || -> Result<()> {
-            db.connection()?.execute(
+            conn.execute(
                 r#"
                     INSERT INTO fuid_to_dhash (fuid, dhash)
                     VALUES (?, ?)
@@ -419,10 +426,9 @@ impl Database {
     }
 
     async fn user_whitelisted(&self, group_id: i64, user_id: u64) -> Result<bool> {
-        let db = self.clone();
         let user_id = i64::try_from(user_id)?;
+        let conn = self.connection().await?;
         spawn_blocking(move || -> Result<bool> {
-            let conn = db.connection()?;
             Ok(conn.query_row(
                 r#"
                     SELECT EXISTS(
@@ -439,9 +445,8 @@ impl Database {
     }
 
     async fn observe(&self, group_id: i64, hash: [u8; 8], message_id: i32) -> Result<Observation> {
-        let db = self.clone();
+        let mut conn = self.connection().await?;
         spawn_blocking(move || -> Result<Observation> {
-            let mut conn = db.connection()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let existing = read_info(&tx, group_id, hash)?;
             if let Some(info) = &existing
@@ -492,9 +497,8 @@ impl Database {
     }
 
     async fn info(&self, group_id: i64, hash: [u8; 8]) -> Result<MarsInfo> {
-        let db = self.clone();
+        let conn = self.connection().await?;
         spawn_blocking(move || -> Result<MarsInfo> {
-            let conn = db.connection()?;
             Ok(read_info(&conn, group_id, hash)?.unwrap_or(MarsInfo {
                 dhash: hash,
                 count: 0,
@@ -506,9 +510,8 @@ impl Database {
     }
 
     async fn set_image_whitelist(&self, group_id: i64, hash: [u8; 8], enabled: bool) -> Result<()> {
-        let db = self.clone();
+        let conn = self.connection().await?;
         spawn_blocking(move || -> Result<()> {
-            let conn = db.connection()?;
             conn.execute(
                 r#"
                     INSERT INTO mars_info (group_id, pic_dhash, count, last_msg_id, in_whitelist)
@@ -525,10 +528,9 @@ impl Database {
     }
 
     async fn set_user_whitelist(&self, group_id: i64, user_id: u64, enabled: bool) -> Result<bool> {
-        let db = self.clone();
         let user_id = i64::try_from(user_id)?;
+        let conn = self.connection().await?;
         spawn_blocking(move || -> Result<bool> {
-            let conn = db.connection()?;
             let changed = if enabled {
                 conn.execute(
                     r#"
@@ -553,9 +555,8 @@ impl Database {
     }
 
     async fn stats(&self, group_id: i64) -> Result<(i64, i64)> {
-        let db = self.clone();
+        let conn = self.connection().await?;
         spawn_blocking(move || -> Result<(i64, i64)> {
-            let conn = db.connection()?;
             let groups = conn.query_row(
                 r#"SELECT COUNT(*) FROM mars_group_stat WHERE group_id < 0"#,
                 [],
@@ -577,9 +578,8 @@ impl Database {
     }
 
     async fn similar(&self, group_id: i64, hash: [u8; 8]) -> Result<Vec<(MarsInfo, u32)>> {
-        let db = self.clone();
+        let conn = self.connection().await?;
         spawn_blocking(move || -> Result<Vec<(MarsInfo, u32)>> {
-            let conn = db.connection()?;
             let mut st = conn.prepare(
                 r#"
                     SELECT pic_dhash, count, last_msg_id, in_whitelist
@@ -619,11 +619,11 @@ impl Database {
     }
 
     async fn export_zip(&self, group_id: i64) -> Result<PathBuf> {
-        let db = self.clone();
-        spawn_blocking(move || db.write_export_zip(group_id)).await?
+        let conn = self.connection().await?;
+        spawn_blocking(move || Self::write_export_zip(group_id, conn)).await?
     }
 
-    fn write_export_zip(&self, group_id: i64) -> Result<PathBuf> {
+    fn write_export_zip(group_id: i64, conn: PooledConnection) -> Result<PathBuf> {
         let archive = env::temp_dir().join(format!("mars-export-{group_id}.zip"));
         let result = (|| -> Result<()> {
             let file = File::create(&archive).context("create export ZIP")?;
@@ -635,7 +635,6 @@ impl Database {
                 .context("start CSV in export ZIP")?;
             writeln!(zip, "group_id,pic_dhash,count,last_msg_id,in_whitelist")?;
 
-            let conn = self.connection()?;
             let mut statement = conn.prepare(
                 r#"
                     SELECT pic_dhash, count, last_msg_id, in_whitelist
@@ -672,9 +671,8 @@ impl Database {
     }
 
     async fn checkpoint(&self) -> Result<()> {
-        let db = self.clone();
+        let conn = self.connection().await?;
         let (busy, log_frames, checkpointed_frames) = spawn_blocking(move || -> Result<_> {
-            let conn = db.connection()?;
             conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -1470,16 +1468,29 @@ async fn wait_for_shutdown() -> Result<&'static str> {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let config = Config::load()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(config.tokio_worker_threads)
+        .max_blocking_threads(config.tokio_max_blocking_threads)
+        .enable_all()
+        .build()
+        .context("build Tokio runtime")?;
+    runtime.block_on(run(config))
+}
+
+async fn run(config: Config) -> Result<()> {
     let http = http_client(&config)?;
     let bot = Bot::builder()
         .api_url(config.api_url())
         .client(http.clone())
         .build();
     let me = bot.get_me().await?.result;
-    let db = Database::open(config.database_path.clone()).await?;
+    let db = Database::open(
+        config.database_path.clone(),
+        config.tokio_max_blocking_threads,
+    )
+    .await?;
     let app = App {
         bot,
         http,
@@ -1572,6 +1583,22 @@ mod tests {
     fn hamming_uses_xor() {
         assert_eq!(hamming([0; 8], [0, 0, 0, 0, 0, 0, 0, 1]), 1);
     }
+    #[test]
+    fn thread_count_uses_default_or_positive_value() {
+        assert_eq!(parse_thread_count("THREADS", None, 4).unwrap(), 4);
+        assert_eq!(parse_thread_count("THREADS", Some("7"), 4).unwrap(), 7);
+    }
+    #[test]
+    fn thread_count_rejects_invalid_values() {
+        for value in ["0", "-1", "abc", "184467440737095516160"] {
+            let error = parse_thread_count("THREADS", Some(value), 4).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("THREADS must be a positive integer")
+            );
+        }
+    }
     #[tokio::test]
     async fn database_preserves_counting_and_whitelists() {
         let path = env::temp_dir().join(format!(
@@ -1582,8 +1609,9 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let db = Database::open(path.clone()).await.unwrap();
-        assert_eq!(db.pool.state().connections, 1);
+        const POOL_SIZE: usize = 3;
+        let db = Database::open(path.clone(), POOL_SIZE).await.unwrap();
+        assert_eq!(db.pool.max_size(), POOL_SIZE);
         let hash = [7; 8];
         assert!(db.observe(-100, hash, 10).await.unwrap().previous.is_none());
         assert_eq!(

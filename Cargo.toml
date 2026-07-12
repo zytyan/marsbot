@@ -14,4 +14,6 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "m
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 frankenstein = { version = "0.50", features = ["client-reqwest"] }
+zip = { version = "2.4", default-features = false, features = ["deflate"] }

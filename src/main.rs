@@ -1,12 +1,3 @@
-use std::{
-    collections::HashMap,
-    env,
-    path::{Path, PathBuf},
-    process::Command,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
-
 use anyhow::{Context, Result, anyhow};
 use frankenstein::{
     AsyncTelegramApi, ParseMode,
@@ -28,11 +19,26 @@ use opencv::{
     imgcodecs, imgproc,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
-use tokio::{signal, task::spawn_blocking, time::sleep};
+use std::{
+    collections::HashMap,
+    env,
+    fs::File,
+    io::{BufWriter, Write},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::{
+    signal,
+    task::spawn_blocking,
+    time::{sleep, timeout},
+};
+use tokio_util::task::TaskTracker;
+use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 const SCHEMA_VERSION: i64 = 1;
 const GROUP_WAIT: Duration = Duration::from_millis(1500);
-
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone, Debug)]
 struct Config {
     token: String,
@@ -419,12 +425,77 @@ impl Database {
         .await?
     }
 
-    async fn export_csv(&self, group_id: i64) -> Result<String> {
+    async fn export_zip(&self, group_id: i64) -> Result<PathBuf> {
         let db = self.clone();
-        spawn_blocking(move || -> Result<String> { let conn = db.connection()?; let mut text = String::from("group_id,pic_dhash,count,last_msg_id,in_whitelist\n"); let mut st = conn.prepare("SELECT pic_dhash,count,last_msg_id,in_whitelist FROM mars_info WHERE group_id=? ORDER BY pic_dhash")?; let rows = st.query_map([group_id], |r| Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,i64>(1)?,r.get::<_,i32>(2)?,r.get::<_,i64>(3)?)))?; for row in rows { let (hash,count,msg,white)=row?; text.push_str(&format!("{group_id},{},{count},{msg},{white}\n", hex(&hash))); } Ok(text) }).await?
+        spawn_blocking(move || db.write_export_zip(group_id)).await?
+    }
+
+    fn write_export_zip(&self, group_id: i64) -> Result<PathBuf> {
+        let archive = env::temp_dir().join(format!("mars-export-{group_id}.zip"));
+        let result = (|| -> Result<()> {
+            let file = File::create(&archive).context("create export ZIP")?;
+            let mut zip = ZipWriter::new(BufWriter::new(file));
+            let options = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Deflated)
+                .compression_level(Some(1));
+            zip.start_file(format!("mars-export-{group_id}.csv"), options)
+                .context("start CSV in export ZIP")?;
+            writeln!(zip, "group_id,pic_dhash,count,last_msg_id,in_whitelist")?;
+
+            let conn = self.connection()?;
+            let mut statement = conn.prepare(
+                "SELECT pic_dhash,count,last_msg_id,in_whitelist FROM mars_info WHERE group_id=? ORDER BY pic_dhash",
+            )?;
+            let rows = statement.query_map([group_id], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i32>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (hash, count, message_id, in_whitelist) = row?;
+                writeln!(
+                    zip,
+                    "{group_id},{},{count},{message_id},{in_whitelist}",
+                    hex(&hash)
+                )?;
+            }
+
+            zip.finish().context("finish export ZIP")?.flush()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&archive);
+            return Err(error);
+        }
+        Ok(archive)
+    }
+
+    async fn checkpoint(&self) -> Result<()> {
+        let db = self.clone();
+        let (busy, log_frames, checkpointed_frames) = spawn_blocking(move || -> Result<_> {
+            let conn = db.connection()?;
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(Into::into)
+        })
+        .await??;
+        if busy != 0 {
+            return Err(anyhow!(
+                "WAL checkpoint remained busy after checkpointing {checkpointed_frames}/{log_frames} frame(s)"
+            ));
+        }
+        eprintln!("marsbot checkpointed {checkpointed_frames}/{log_frames} WAL frame(s)");
+        Ok(())
     }
 }
-
 fn to_sql_error(error: anyhow::Error) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error.to_string())))
 }
@@ -433,7 +504,13 @@ fn blob_to_hash(blob: Vec<u8>) -> Result<[u8; 8]> {
         .map_err(|v: Vec<u8>| anyhow!("invalid dhash length {}", v.len()))
 }
 fn read_info(conn: &Connection, group_id: i64, hash: [u8; 8]) -> Result<Option<MarsInfo>> {
-    conn.query_row("SELECT pic_dhash,count,last_msg_id,in_whitelist FROM mars_info WHERE group_id=? AND pic_dhash=?", params![group_id,hash.to_vec()], |r| Ok(MarsInfo { dhash: blob_to_hash(r.get::<_,Vec<u8>>(0)?).map_err(to_sql_error)?, count:r.get(1)?,last_msg_id:r.get(2)?,in_whitelist:r.get::<_,i64>(3)? != 0 })).optional().map_err(Into::into)
+    conn.query_row("SELECT pic_dhash,count,last_msg_id,in_whitelist FROM mars_info WHERE group_id=? AND pic_dhash=?", params![group_id,hash.to_vec()], 
+    |r| Ok(MarsInfo {
+        dhash: blob_to_hash(r.get::<_,Vec<u8>>(0)?).map_err(to_sql_error)?,
+                count:r.get(1)?,
+                last_msg_id:r.get(2)?,
+                in_whitelist:r.get::<_,i64>(3)? != 0 })
+        ).optional().map_err(Into::into)
 }
 fn increase_group_stat(conn: &rusqlite::Transaction<'_>, group_id: i64) -> Result<()> {
     let existed: Option<i64> = conn
@@ -494,8 +571,8 @@ struct App {
     self_username: Option<String>,
     media_groups: Arc<Mutex<HashMap<String, Vec<PhotoEvent>>>>,
     export_locks: Arc<Mutex<HashMap<i64, bool>>>,
+    tasks: TaskTracker,
 }
-
 #[derive(Clone)]
 struct PhotoEvent {
     chat: Chat,
@@ -516,56 +593,18 @@ impl App {
     ) -> Result<()> {
         let text = text.into();
         let reply = ReplyParameters::builder().message_id(message_id).build();
-        match (html, keyboard) {
-            (false, None) => {
-                self.bot
-                    .send_message(
-                        &SendMessageParams::builder()
-                            .chat_id(ChatId::Integer(chat_id))
-                            .text(text)
-                            .reply_parameters(reply)
-                            .build(),
-                    )
-                    .await?
-            }
-            (true, None) => {
-                self.bot
-                    .send_message(
-                        &SendMessageParams::builder()
-                            .chat_id(ChatId::Integer(chat_id))
-                            .text(text)
-                            .reply_parameters(reply)
-                            .parse_mode(ParseMode::Html)
-                            .build(),
-                    )
-                    .await?
-            }
-            (false, Some(k)) => {
-                self.bot
-                    .send_message(
-                        &SendMessageParams::builder()
-                            .chat_id(ChatId::Integer(chat_id))
-                            .text(text)
-                            .reply_parameters(reply)
-                            .reply_markup(ReplyMarkup::InlineKeyboardMarkup(k))
-                            .build(),
-                    )
-                    .await?
-            }
-            (true, Some(k)) => {
-                self.bot
-                    .send_message(
-                        &SendMessageParams::builder()
-                            .chat_id(ChatId::Integer(chat_id))
-                            .text(text)
-                            .reply_parameters(reply)
-                            .parse_mode(ParseMode::Html)
-                            .reply_markup(ReplyMarkup::InlineKeyboardMarkup(k))
-                            .build(),
-                    )
-                    .await?
-            }
-        };
+        let mut message = SendMessageParams::builder()
+            .chat_id(ChatId::Integer(chat_id))
+            .text(text)
+            .reply_parameters(reply)
+            .build();
+        if let Some(k) = keyboard {
+            message.reply_markup = Some(ReplyMarkup::InlineKeyboardMarkup(k));
+        }
+        if html {
+            message.parse_mode = Some(ParseMode::Html);
+        }
+        self.bot.send_message(&message).await?;
         Ok(())
     }
 
@@ -617,9 +656,10 @@ impl App {
 
     async fn handle_photo(&self, event: PhotoEvent) -> Result<Option<(PhotoEvent, MarsInfo)>> {
         if let Some(user_id) = event.user_id
-            && self.db.user_whitelisted(event.chat.id, user_id).await? {
-                return Ok(None);
-            }
+            && self.db.user_whitelisted(event.chat.id, user_id).await?
+        {
+            return Ok(None);
+        }
         let hash = self.file_hash(&event).await?;
         let observed = self
             .db
@@ -673,7 +713,7 @@ impl App {
             if first {
                 let app = self.clone();
                 let key = group.clone();
-                tokio::spawn(async move {
+                self.tasks.spawn(async move {
                     sleep(GROUP_WAIT).await;
                     if let Err(e) = app.process_group(key).await {
                         eprintln!("media group error: {e:#}");
@@ -704,9 +744,10 @@ impl App {
         let mut best: Option<(PhotoEvent, MarsInfo)> = None;
         for event in events {
             if let Some((event, previous)) = self.handle_photo(event).await?
-                && best.as_ref().is_none_or(|(_, p)| previous.count > p.count) {
-                    best = Some((event, previous));
-                }
+                && best.as_ref().is_none_or(|(_, p)| previous.count > p.count)
+            {
+                best = Some((event, previous));
+            }
         }
         if let Some((event, previous)) = best {
             self.maybe_report(event.chat.id, previous.count).await;
@@ -843,8 +884,7 @@ impl App {
             .await?;
             return Ok(());
         }
-        let csv = self.db.export_csv(chat_id).await?;
-        let path = spawn_blocking(move || make_archive(chat_id, csv)).await??;
+        let path = self.db.export_zip(chat_id).await?;
         let result = self
             .bot
             .send_document(
@@ -874,25 +914,6 @@ impl App {
     }
 }
 
-fn make_archive(chat_id: i64, csv: String) -> Result<PathBuf> {
-    let root = env::temp_dir();
-    let csv_path = root.join(format!("mars-export-{chat_id}.csv"));
-    let archive = root.join(format!("mars-export-{chat_id}.csv.tar.gz"));
-    std::fs::write(&csv_path, csv)?;
-    let status = Command::new("tar")
-        .arg("-zcf")
-        .arg(&archive)
-        .arg("-C")
-        .arg(&root)
-        .arg(csv_path.file_name().unwrap())
-        .status()
-        .context("run tar")?;
-    let _ = std::fs::remove_file(&csv_path);
-    if !status.success() {
-        return Err(anyhow!("tar failed with {status}"));
-    }
-    Ok(archive)
-}
 fn parse_hash(value: &str) -> Option<[u8; 8]> {
     if value.len() != 16 {
         return None;
@@ -1021,6 +1042,26 @@ fn updates_params(offset: Option<i64>) -> GetUpdatesParams {
     }
 }
 
+async fn wait_for_shutdown() -> Result<&'static str> {
+    #[cfg(unix)]
+    {
+        let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .context("install SIGTERM handler")?;
+        tokio::select! {
+            result = signal::ctrl_c() => {
+                result.context("install Ctrl-C handler")?;
+                Ok("SIGINT")
+            }
+            _ = terminate.recv() => Ok("SIGTERM"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        signal::ctrl_c().await.context("install Ctrl-C handler")?;
+        Ok("Ctrl-C")
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::load()?;
@@ -1040,16 +1081,55 @@ async fn main() -> Result<()> {
         self_username: me.username,
         media_groups: Arc::new(Mutex::new(HashMap::new())),
         export_locks: Arc::new(Mutex::new(HashMap::new())),
+        tasks: TaskTracker::new(),
     };
     eprintln!("marsbot started as id={}", app.self_id);
     let mut offset: Option<i64> = None;
+    let shutdown = wait_for_shutdown();
+    tokio::pin!(shutdown);
     loop {
         let params = updates_params(offset);
-        tokio::select! { _=signal::ctrl_c()=> { eprintln!("marsbot stopping"); break; }, response=app.bot.get_updates(&params) => match response { Ok(result)=> { for update in result.result { offset=Some(i64::from(update.update_id)+1); let app=app.clone(); tokio::spawn(async move { if let Err(e)=dispatch(app,update).await { eprintln!("update failed: {e:#}"); } }); } }, Err(e)=> { eprintln!("getUpdates failed: {e}"); sleep(Duration::from_secs(2)).await; } } }
+        tokio::select! {
+            biased;
+            reason = &mut shutdown => {
+                eprintln!("marsbot received {}, stopping updates", reason?);
+                break;
+            }
+            response = app.bot.get_updates(&params) => match response {
+                Ok(result) => for update in result.result {
+                    offset = Some(i64::from(update.update_id) + 1);
+                    let app = app.clone();
+                    let tasks = app.tasks.clone();
+                    tasks.spawn(async move {
+                        if let Err(e) = dispatch(app, update).await {
+                            eprintln!("update failed: {e:#}");
+                        }
+                    });
+                },
+                Err(e) => { eprintln!("getUpdates failed: {e}"); sleep(Duration::from_secs(2)).await; }
+            }
+        }
+    }
+    app.tasks.close();
+    let count = app.tasks.len();
+    if count > 0 {
+        eprintln!("marsbot waiting for {count} in-flight task(s)");
+    }
+    let drained = match timeout(SHUTDOWN_TIMEOUT, app.tasks.wait()).await {
+        Ok(()) => true,
+        Err(_) => {
+            eprintln!(
+                "marsbot shutdown timed out after {} seconds; skipping WAL checkpoint",
+                SHUTDOWN_TIMEOUT.as_secs()
+            );
+            false
+        }
+    };
+    if drained {
+        app.db.checkpoint().await?;
     }
     Ok(())
 }
-
 async fn dispatch(app: App, update: Update) -> Result<()> {
     match update.content {
         UpdateContent::Message(m) => app.handle_message(*m, false).await,
@@ -1065,6 +1145,7 @@ async fn dispatch(app: App, update: Update) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     #[test]
     fn masking_keeps_edges() {
         assert_eq!(mask("1234567890"), "1234**7890");
@@ -1110,8 +1191,26 @@ mod tests {
         assert!(db.user_whitelisted(-100, 42).await.unwrap());
         db.set_image_whitelist(-100, hash, true).await.unwrap();
         assert!(db.observe(-100, hash, 12).await.unwrap().ignored);
+        let archive = db.export_zip(-100).await.unwrap();
+        let mut zip = zip::ZipArchive::new(File::open(&archive).unwrap()).unwrap();
+        assert_eq!(zip.len(), 1);
+        let mut csv = String::new();
+        {
+            let mut entry = zip.by_index(0).unwrap();
+            assert_eq!(entry.name(), "mars-export--100.csv");
+            assert_eq!(entry.compression(), CompressionMethod::Deflated);
+            entry.read_to_string(&mut csv).unwrap();
+        }
+        let mut rows = csv.lines();
+        assert_eq!(
+            rows.next(),
+            Some("group_id,pic_dhash,count,last_msg_id,in_whitelist")
+        );
+        assert_eq!(rows.next(), Some("-100,0707070707070707,2,11,1"));
+        db.checkpoint().await.unwrap();
         drop(db);
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&archive);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
     }

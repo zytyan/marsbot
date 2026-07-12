@@ -1012,12 +1012,119 @@ impl App {
         };
         let chat_id = message.chat.id;
         match command {
-            "help" | "start" => { if matches!(message.chat.type_field,ChatType::Private) || command=="help" { self.reply(chat_id,message.message_id,help_text(self.self_username.as_deref()),false,None).await?; } }
-            "stat" => { let (groups,images)=self.db.stats(chat_id).await?; let user=message.from.as_ref(); let white=match user { Some(u)=>self.db.user_whitelisted(chat_id,u.id).await?, None=>false }; let name=user.map(|u|u.first_name.as_str()).unwrap_or("unknown"); self.reply(chat_id,message.message_id,format!("火星车当前一共服务了{groups}个群组\n当前群组ID: {chat_id}\n您是 {name}，您{}本群白名单当中\n本群一共记录了 {images} 张不同的图片\n火星车与您同在",if white{"在"}else{"不在"}),false,None).await?; }
-            "pic_info" | "add_whitelist" | "remove_whitelist" => { let Some(event)=photo_reference(message) else { self.reply(chat_id,message.message_id,"火星车没有发现您引用了任何图片。请发送图片使用命令，或回复特定图片。",false,None).await?; return Ok(()); }; let hash=self.file_hash(&event).await?; let info=self.db.info(chat_id,hash).await?; match command { "pic_info" => { let text=format!("File unique id: {}\ndhash: {}\n在本群的火星次数:{}\n{}",event.file_unique_id,hex(&hash).to_ascii_uppercase(),info.count,if info.in_whitelist{"🙈 它在本群的火星白名单中"}else{"🟢 它不在本群的火星白名单当中"}); let button=InlineKeyboardButton::builder().text("查找DHASH相似图片").callback_data(format!("find:{}",hex(&hash))).build(); self.reply(chat_id,message.message_id,text,false,Some(InlineKeyboardMarkup::builder().inline_keyboard(vec![vec![button]]).build())).await?; }, "add_whitelist" => { self.db.set_image_whitelist(chat_id,hash,true).await?; self.reply(chat_id,message.message_id,if info.in_whitelist{"这张图片已经在白名单当中了"}else{"成功将图片加入白名单"},false,None).await?; }, _ => { self.db.set_image_whitelist(chat_id,hash,false).await?; self.reply(chat_id,message.message_id,if info.in_whitelist{"成功将图片移除白名单"}else{"这张图片并不在白名单中"},false,None).await?; } } }
-            "add_me_to_whitelist" | "remove_me_from_whitelist" => if let Some(user)=&message.from { let added=self.db.set_user_whitelist(chat_id,user.id,command=="add_me_to_whitelist").await?; let text=match (command,added) { ("add_me_to_whitelist",true)=>"已将您加入白名单，您发的图片不会被处理。", ("add_me_to_whitelist",false)=>"您已经在本群白名单中。", ("remove_me_from_whitelist",true)=>"已将您移出白名单，火星车会继续工作。", _=>"您不在本群白名单中，火星车正在工作。" }; self.reply(chat_id,message.message_id,text,false,None).await?; }
+            "help" | "start" => {
+                if matches!(message.chat.type_field, ChatType::Private) || command == "help" {
+                    self.reply(
+                        chat_id,
+                        message.message_id,
+                        help_text(self.self_username.as_deref()),
+                        false,
+                        None,
+                    )
+                    .await?;
+                }
+            }
+            "stat" => {
+                let (groups, images) = self.db.stats(chat_id).await?;
+                let user = message.from.as_ref();
+                let white = match user {
+                    Some(user) => self.db.user_whitelisted(chat_id, user.id).await?,
+                    None => false,
+                };
+                let name = user.map(|user| user.first_name.as_str()).unwrap_or("unknown");
+                let text = format!(
+                    "火星车当前一共服务了{groups}个群组\n当前群组ID: {chat_id}\n您是 {name}，您{}本群白名单当中\n本群一共记录了 {images} 张不同的图片\n火星车与您同在",
+                    if white { "在" } else { "不在" }
+                );
+                self.reply(chat_id, message.message_id, text, false, None)
+                    .await?;
+            }
+            "pic_info" | "add_whitelist" | "remove_whitelist" => {
+                let Some(event) = photo_reference(message) else {
+                    self.reply(
+                        chat_id,
+                        message.message_id,
+                        "火星车没有发现您引用了任何图片。请发送图片使用命令，或回复特定图片。",
+                        false,
+                        None,
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                let hash = self.file_hash(&event).await?;
+                let info = self.db.info(chat_id, hash).await?;
+                match command {
+                    "pic_info" => {
+                        let text = format!(
+                            "File unique id: {}\ndhash: {}\n在本群的火星次数:{}\n{}",
+                            event.file_unique_id,
+                            hex(&hash).to_ascii_uppercase(),
+                            info.count,
+                            if info.in_whitelist {
+                                "🙈 它在本群的火星白名单中"
+                            } else {
+                                "🟢 它不在本群的火星白名单当中"
+                            }
+                        );
+                        let button = InlineKeyboardButton::builder()
+                            .text("查找DHASH相似图片")
+                            .callback_data(format!("find:{}", hex(&hash)))
+                            .build();
+                        let markup = InlineKeyboardMarkup::builder()
+                            .inline_keyboard(vec![vec![button]])
+                            .build();
+                        self.reply(chat_id, message.message_id, text, false, Some(markup))
+                            .await?;
+                    }
+                    "add_whitelist" => {
+                        self.db.set_image_whitelist(chat_id, hash, true).await?;
+                        let text = if info.in_whitelist {
+                            "这张图片已经在白名单当中了"
+                        } else {
+                            "成功将图片加入白名单"
+                        };
+                        self.reply(chat_id, message.message_id, text, false, None)
+                            .await?;
+                    }
+                    _ => {
+                        self.db.set_image_whitelist(chat_id, hash, false).await?;
+                        let text = if info.in_whitelist {
+                            "成功将图片移除白名单"
+                        } else {
+                            "这张图片并不在白名单中"
+                        };
+                        self.reply(chat_id, message.message_id, text, false, None)
+                            .await?;
+                    }
+                }
+            }
+            "add_me_to_whitelist" | "remove_me_from_whitelist" => {
+                if let Some(user) = &message.from {
+                    let added = self
+                        .db
+                        .set_user_whitelist(chat_id, user.id, command == "add_me_to_whitelist")
+                        .await?;
+                    let text = match (command, added) {
+                        ("add_me_to_whitelist", true) => "已将您加入白名单，您发的图片不会被处理。",
+                        ("add_me_to_whitelist", false) => "您已经在本群白名单中。",
+                        ("remove_me_from_whitelist", true) => "已将您移出白名单，火星车会继续工作。",
+                        _ => "您不在本群白名单中，火星车正在工作。",
+                    };
+                    self.reply(chat_id, message.message_id, text, false, None)
+                        .await?;
+                }
+            }
             "mars_bot_welcome" => self.send_welcome(chat_id).await?,
-            "export" => self.reply(chat_id,message.message_id,"想部署自己的火星车，又放不下当前数据？请使用 /ensure_marsbot_export 导出本聊天数据。",false,None).await?,
+            "export" => {
+                self.reply(
+                    chat_id,
+                    message.message_id,
+                    "想部署自己的火星车，又放不下当前数据？请使用 /ensure_marsbot_export 导出本聊天数据。",
+                    false,
+                    None,
+                )
+                .await?
+            }
             "ensure_marsbot_export" => self.export(chat_id,message.message_id).await?,
             _ => {}
         }
@@ -1069,7 +1176,17 @@ impl App {
         Ok(())
     }
     async fn send_welcome(&self, chat_id: i64) -> Result<()> {
-        self.bot.send_message(&SendMessageParams::builder().chat_id(ChatId::Integer(chat_id)).text("欢迎使用火星车。\n本 bot 会检测群组中重复发送的普通图片；只保存群组 ID、图片唯一 ID、dHash、消息 ID 与白名单状态，不保存图片。\n它不检查文件形式图片、表情包、视频或 GIF。\n<a href=\"https://github.com/zytyan/pymarsbot\">原项目</a>").parse_mode(ParseMode::Html).build()).await?;
+        let params = SendMessageParams::builder()
+            .chat_id(ChatId::Integer(chat_id))
+            .text(concat!(
+                "欢迎使用火星车。\n本 bot 会检测群组中重复发送的普通图片；",
+                "只保存群组 ID、图片唯一 ID、dHash、消息 ID 与白名单状态，不保存图片。\n",
+                "它不检查文件形式图片、表情包、视频或 GIF。\n",
+                "<a href=\"https://github.com/zytyan/pymarsbot\">原项目</a>"
+            ))
+            .parse_mode(ParseMode::Html)
+            .build();
+        self.bot.send_message(&params).await?;
         Ok(())
     }
     async fn handle_membership(&self, update: &ChatMemberUpdated) -> Result<()> {
@@ -1078,7 +1195,11 @@ impl App {
         }
         match (&update.old_chat_member, &update.new_chat_member) {
             (_, ChatMember::Administrator(_)) => {
-                self.bot.send_message(&SendMessageParams::builder().chat_id(ChatId::Integer(update.chat.id)).text("火星车的任何功能均不需要管理员权限，您无需将本 bot 设置为群组管理员。").build()).await?;
+                let params = SendMessageParams::builder()
+                    .chat_id(ChatId::Integer(update.chat.id))
+                    .text("火星车的任何功能均不需要管理员权限，您无需将本 bot 设置为群组管理员。")
+                    .build();
+                self.bot.send_message(&params).await?;
             }
             (ChatMember::Left(_) | ChatMember::Kicked(_), ChatMember::Member(_)) => {
                 self.send_welcome(update.chat.id).await?;
@@ -1237,7 +1358,17 @@ fn whitelist_button(info: &MarsInfo) -> Option<InlineKeyboardMarkup> {
 fn help_text(username: Option<&str>) -> String {
     let suffix = username.map(|v| format!("@{v}")).unwrap_or_default();
     format!(
-        "/help{suffix} 显示本帮助信息\n/stat{suffix} 显示统计信息\n/pic_info{suffix} 获取图片信息\n/add_whitelist{suffix} 将图片添加到白名单\n/remove_whitelist{suffix} 将图片移除白名单\n/add_me_to_whitelist{suffix} 将用户加入群组白名单\n/remove_me_from_whitelist{suffix} 将用户移出群组白名单\n/export{suffix} 导出说明"
+        concat!(
+            "/help{} 显示本帮助信息\n",
+            "/stat{} 显示统计信息\n",
+            "/pic_info{} 获取图片信息\n",
+            "/add_whitelist{} 将图片添加到白名单\n",
+            "/remove_whitelist{} 将图片移除白名单\n",
+            "/add_me_to_whitelist{} 将用户加入群组白名单\n",
+            "/remove_me_from_whitelist{} 将用户移出群组白名单\n",
+            "/export{} 导出说明"
+        ),
+        suffix, suffix, suffix, suffix, suffix, suffix, suffix, suffix
     )
 }
 fn callback_message(message: &Option<MaybeInaccessibleMessage>) -> Option<(i64, i32)> {

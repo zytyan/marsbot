@@ -301,31 +301,82 @@ impl Database {
 
     fn initialize(&self) -> Result<()> {
         let conn = self.connection()?;
-        conn.execute_batch("\
-            CREATE TABLE IF NOT EXISTS mars_info (
-              group_id INTEGER NOT NULL, pic_dhash BLOB NOT NULL, count INTEGER NOT NULL DEFAULT 0 CHECK(count >= 0),
-              last_msg_id INTEGER NOT NULL DEFAULT 0 CHECK(last_msg_id >= 0), in_whitelist INTEGER NOT NULL DEFAULT 0 CHECK(in_whitelist IN (0,1)),
-              PRIMARY KEY(group_id,pic_dhash)) WITHOUT ROWID;
-            CREATE TABLE IF NOT EXISTS fuid_to_dhash (fuid TEXT PRIMARY KEY NOT NULL, dhash BLOB NOT NULL) WITHOUT ROWID;
-            CREATE TABLE IF NOT EXISTS group_user_in_whitelist (group_id INTEGER NOT NULL, user_id INTEGER NOT NULL, PRIMARY KEY(group_id,user_id)) WITHOUT ROWID;
-            CREATE TABLE IF NOT EXISTS mars_group_stat (group_id INTEGER PRIMARY KEY NOT NULL, image_count INTEGER NOT NULL DEFAULT 0 CHECK(image_count >= 0)) WITHOUT ROWID;
-            CREATE TABLE IF NOT EXISTS mars_stat_meta (key TEXT PRIMARY KEY NOT NULL, value INTEGER NOT NULL) WITHOUT ROWID;")?;
+        conn.execute_batch(
+            r#"
+                CREATE TABLE IF NOT EXISTS mars_info (
+                    group_id INTEGER NOT NULL,
+                    pic_dhash BLOB NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0 CHECK(count >= 0),
+                    last_msg_id INTEGER NOT NULL DEFAULT 0 CHECK(last_msg_id >= 0),
+                    in_whitelist INTEGER NOT NULL DEFAULT 0 CHECK(in_whitelist IN (0, 1)),
+                    PRIMARY KEY(group_id, pic_dhash)
+                ) WITHOUT ROWID;
+
+                CREATE TABLE IF NOT EXISTS fuid_to_dhash (
+                    fuid TEXT PRIMARY KEY NOT NULL,
+                    dhash BLOB NOT NULL
+                ) WITHOUT ROWID;
+
+                CREATE TABLE IF NOT EXISTS group_user_in_whitelist (
+                    group_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    PRIMARY KEY(group_id, user_id)
+                ) WITHOUT ROWID;
+
+                CREATE TABLE IF NOT EXISTS mars_group_stat (
+                    group_id INTEGER PRIMARY KEY NOT NULL,
+                    image_count INTEGER NOT NULL DEFAULT 0 CHECK(image_count >= 0)
+                ) WITHOUT ROWID;
+
+                CREATE TABLE IF NOT EXISTS mars_stat_meta (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    value INTEGER NOT NULL
+                ) WITHOUT ROWID;
+            "#,
+        )?;
         let version: i64 = conn.query_row(
-            "SELECT COALESCE((SELECT value FROM mars_stat_meta WHERE key='schema_version'), 0)",
+            r#"
+                SELECT COALESCE(
+                    (SELECT value FROM mars_stat_meta WHERE key = 'schema_version'),
+                    0
+                )
+            "#,
             [],
             |r| r.get(0),
         )?;
         if version < SCHEMA_VERSION {
             let tx = conn.unchecked_transaction()?;
             tx.execute("DELETE FROM mars_group_stat", [])?;
-            tx.execute("INSERT INTO mars_group_stat(group_id,image_count) SELECT group_id,COUNT(*) FROM mars_info GROUP BY group_id", [])?;
+            tx.execute(
+                r#"
+                    INSERT INTO mars_group_stat (group_id, image_count)
+                    SELECT group_id, COUNT(*)
+                    FROM mars_info
+                    GROUP BY group_id
+                "#,
+                [],
+            )?;
             let groups: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM mars_group_stat WHERE group_id < 0",
                 [],
                 |r| r.get(0),
             )?;
-            tx.execute("INSERT INTO mars_stat_meta(key,value) VALUES('group_count',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [groups])?;
-            tx.execute("INSERT INTO mars_stat_meta(key,value) VALUES('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [SCHEMA_VERSION])?;
+            tx.execute(
+                r#"
+                    INSERT INTO mars_stat_meta (key, value)
+                    VALUES ('group_count', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                "#,
+                [groups],
+            )?;
+            tx.execute(
+                r#"
+                    INSERT INTO mars_stat_meta (key, value)
+                    VALUES ('schema_version', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                "#,
+                [SCHEMA_VERSION],
+            )?;
             tx.commit()?;
         }
         Ok(())
@@ -351,7 +402,11 @@ impl Database {
         let db = self.clone();
         spawn_blocking(move || -> Result<()> {
             db.connection()?.execute(
-                "INSERT INTO fuid_to_dhash(fuid,dhash) VALUES(?,?) ON CONFLICT(fuid) DO NOTHING",
+                r#"
+                    INSERT INTO fuid_to_dhash (fuid, dhash)
+                    VALUES (?, ?)
+                    ON CONFLICT(fuid) DO NOTHING
+                "#,
                 params![fuid, hash.to_vec()],
             )?;
             Ok(())
@@ -363,7 +418,21 @@ impl Database {
     async fn user_whitelisted(&self, group_id: i64, user_id: u64) -> Result<bool> {
         let db = self.clone();
         let user_id = i64::try_from(user_id)?;
-        spawn_blocking(move || -> Result<bool> { Ok(db.connection()?.query_row("SELECT EXISTS(SELECT 1 FROM group_user_in_whitelist WHERE group_id=? AND user_id=?)", params![group_id, user_id], |r| r.get::<_, i64>(0))? != 0) }).await?
+        spawn_blocking(move || -> Result<bool> {
+            let conn = db.connection()?;
+            Ok(conn.query_row(
+                r#"
+                    SELECT EXISTS(
+                        SELECT 1
+                        FROM group_user_in_whitelist
+                        WHERE group_id = ? AND user_id = ?
+                    )
+                "#,
+                params![group_id, user_id],
+                |row| row.get::<_, i64>(0),
+            )? != 0)
+        })
+        .await?
     }
 
     async fn observe(&self, group_id: i64, hash: [u8; 8], message_id: i32) -> Result<Observation> {
@@ -373,17 +442,50 @@ impl Database {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let existing = read_info(&tx, group_id, hash)?;
             if let Some(info) = &existing
-                && (info.last_msg_id == message_id || info.in_whitelist) { return Ok(Observation { previous: None, ignored: true }); }
+                && (info.last_msg_id == message_id || info.in_whitelist)
+            {
+                return Ok(Observation {
+                    previous: None,
+                    ignored: true,
+                });
+            }
             let is_new = existing.is_none();
-            let mut next = existing.clone().unwrap_or(MarsInfo { dhash: hash, count: 0, last_msg_id: 0, in_whitelist: false });
+            let mut next = existing.clone().unwrap_or(MarsInfo {
+                dhash: hash,
+                count: 0,
+                last_msg_id: 0,
+                in_whitelist: false,
+            });
             let previous = (next.count > 0).then(|| next.clone());
             next.count += 1;
             next.last_msg_id = message_id;
-            tx.execute("INSERT INTO mars_info(group_id,pic_dhash,count,last_msg_id,in_whitelist) VALUES(?,?,?,?,?) ON CONFLICT(group_id,pic_dhash) DO UPDATE SET count=excluded.count,last_msg_id=excluded.last_msg_id,in_whitelist=excluded.in_whitelist", params![group_id, hash.to_vec(), next.count, next.last_msg_id, i64::from(next.in_whitelist)])?;
-            if is_new { increase_group_stat(&tx, group_id)?; }
+            tx.execute(
+                r#"
+                    INSERT INTO mars_info (group_id, pic_dhash, count, last_msg_id, in_whitelist)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(group_id, pic_dhash) DO UPDATE SET
+                        count = excluded.count,
+                        last_msg_id = excluded.last_msg_id,
+                        in_whitelist = excluded.in_whitelist
+                "#,
+                params![
+                    group_id,
+                    hash.to_vec(),
+                    next.count,
+                    next.last_msg_id,
+                    i64::from(next.in_whitelist)
+                ],
+            )?;
+            if is_new {
+                increase_group_stat(&tx, group_id)?;
+            }
             tx.commit()?;
-            Ok(Observation { previous, ignored: false })
-        }).await?
+            Ok(Observation {
+                previous,
+                ignored: false,
+            })
+        })
+        .await?
     }
 
     async fn info(&self, group_id: i64, hash: [u8; 8]) -> Result<MarsInfo> {
@@ -402,19 +504,78 @@ impl Database {
 
     async fn set_image_whitelist(&self, group_id: i64, hash: [u8; 8], enabled: bool) -> Result<()> {
         let db = self.clone();
-        spawn_blocking(move || -> Result<()> { let conn = db.connection()?; conn.execute("INSERT INTO mars_info(group_id,pic_dhash,count,last_msg_id,in_whitelist) VALUES(?,?,0,0,?) ON CONFLICT(group_id,pic_dhash) DO UPDATE SET in_whitelist=excluded.in_whitelist", params![group_id, hash.to_vec(), i64::from(enabled)])?; Ok(()) }).await??;
+        spawn_blocking(move || -> Result<()> {
+            let conn = db.connection()?;
+            conn.execute(
+                r#"
+                    INSERT INTO mars_info (group_id, pic_dhash, count, last_msg_id, in_whitelist)
+                    VALUES (?, ?, 0, 0, ?)
+                    ON CONFLICT(group_id, pic_dhash) DO UPDATE SET
+                        in_whitelist = excluded.in_whitelist
+                "#,
+                params![group_id, hash.to_vec(), i64::from(enabled)],
+            )?;
+            Ok(())
+        })
+        .await??;
         Ok(())
     }
 
     async fn set_user_whitelist(&self, group_id: i64, user_id: u64, enabled: bool) -> Result<bool> {
         let db = self.clone();
         let user_id = i64::try_from(user_id)?;
-        spawn_blocking(move || -> Result<bool> { let conn = db.connection()?; let n = if enabled { conn.execute("INSERT INTO group_user_in_whitelist(group_id,user_id) VALUES(?,?) ON CONFLICT DO NOTHING", params![group_id,user_id])? } else { conn.execute("DELETE FROM group_user_in_whitelist WHERE group_id=? AND user_id=?", params![group_id,user_id])? }; Ok(n != 0) }).await?
+        spawn_blocking(move || -> Result<bool> {
+            let conn = db.connection()?;
+            let changed = if enabled {
+                conn.execute(
+                    r#"
+                        INSERT INTO group_user_in_whitelist (group_id, user_id)
+                        VALUES (?, ?)
+                        ON CONFLICT DO NOTHING
+                    "#,
+                    params![group_id, user_id],
+                )?
+            } else {
+                conn.execute(
+                    r#"
+                        DELETE FROM group_user_in_whitelist
+                        WHERE group_id = ? AND user_id = ?
+                    "#,
+                    params![group_id, user_id],
+                )?
+            };
+            Ok(changed != 0)
+        })
+        .await?
     }
 
     async fn stats(&self, group_id: i64) -> Result<(i64, i64)> {
         let db = self.clone();
-        spawn_blocking(move || -> Result<(i64,i64)> { let conn = db.connection()?; let groups = conn.query_row("SELECT COALESCE((SELECT value FROM mars_stat_meta WHERE key='group_count'),(SELECT COUNT(*) FROM mars_group_stat WHERE group_id < 0))", [], |r| r.get(0))?; let images = conn.query_row("SELECT COALESCE((SELECT image_count FROM mars_group_stat WHERE group_id=?),0)", [group_id], |r| r.get(0))?; Ok((groups,images)) }).await?
+        spawn_blocking(move || -> Result<(i64, i64)> {
+            let conn = db.connection()?;
+            let groups = conn.query_row(
+                r#"
+                    SELECT COALESCE(
+                        (SELECT value FROM mars_stat_meta WHERE key = 'group_count'),
+                        (SELECT COUNT(*) FROM mars_group_stat WHERE group_id < 0)
+                    )
+                "#,
+                [],
+                |row| row.get(0),
+            )?;
+            let images = conn.query_row(
+                r#"
+                    SELECT COALESCE(
+                        (SELECT image_count FROM mars_group_stat WHERE group_id = ?),
+                        0
+                    )
+                "#,
+                [group_id],
+                |row| row.get(0),
+            )?;
+            Ok((groups, images))
+        })
+        .await?
     }
 
     async fn similar(&self, group_id: i64, hash: [u8; 8]) -> Result<Vec<(MarsInfo, u32)>> {
@@ -422,7 +583,11 @@ impl Database {
         spawn_blocking(move || -> Result<Vec<(MarsInfo, u32)>> {
             let conn = db.connection()?;
             let mut st = conn.prepare(
-                "SELECT pic_dhash,count,last_msg_id,in_whitelist FROM mars_info WHERE group_id=?",
+                r#"
+                    SELECT pic_dhash, count, last_msg_id, in_whitelist
+                    FROM mars_info
+                    WHERE group_id = ?
+                "#,
             )?;
             let mut out = st
                 .query_map([group_id], |r| {
@@ -474,7 +639,12 @@ impl Database {
 
             let conn = self.connection()?;
             let mut statement = conn.prepare(
-                "SELECT pic_dhash,count,last_msg_id,in_whitelist FROM mars_info WHERE group_id=? ORDER BY pic_dhash",
+                r#"
+                    SELECT pic_dhash, count, last_msg_id, in_whitelist
+                    FROM mars_info
+                    WHERE group_id = ?
+                    ORDER BY pic_dhash
+                "#,
             )?;
             let rows = statement.query_map([group_id], |row| {
                 Ok((
@@ -534,13 +704,24 @@ fn blob_to_hash(blob: Vec<u8>) -> Result<[u8; 8]> {
         .map_err(|v: Vec<u8>| anyhow!("invalid dhash length {}", v.len()))
 }
 fn read_info(conn: &Connection, group_id: i64, hash: [u8; 8]) -> Result<Option<MarsInfo>> {
-    conn.query_row("SELECT pic_dhash,count,last_msg_id,in_whitelist FROM mars_info WHERE group_id=? AND pic_dhash=?", params![group_id,hash.to_vec()], 
-    |r| Ok(MarsInfo {
-        dhash: blob_to_hash(r.get::<_,Vec<u8>>(0)?).map_err(to_sql_error)?,
-                count:r.get(1)?,
-                last_msg_id:r.get(2)?,
-                in_whitelist:r.get::<_,i64>(3)? != 0 })
-        ).optional().map_err(Into::into)
+    conn.query_row(
+        r#"
+            SELECT pic_dhash, count, last_msg_id, in_whitelist
+            FROM mars_info
+            WHERE group_id = ? AND pic_dhash = ?
+        "#,
+        params![group_id, hash.to_vec()],
+        |row| {
+            Ok(MarsInfo {
+                dhash: blob_to_hash(row.get::<_, Vec<u8>>(0)?).map_err(to_sql_error)?,
+                count: row.get(1)?,
+                last_msg_id: row.get(2)?,
+                in_whitelist: row.get::<_, i64>(3)? != 0,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
 }
 fn increase_group_stat(conn: &rusqlite::Transaction<'_>, group_id: i64) -> Result<()> {
     let existed: Option<i64> = conn
@@ -550,9 +731,25 @@ fn increase_group_stat(conn: &rusqlite::Transaction<'_>, group_id: i64) -> Resul
             |r| r.get(0),
         )
         .optional()?;
-    conn.execute("INSERT INTO mars_group_stat(group_id,image_count) VALUES(?,1) ON CONFLICT(group_id) DO UPDATE SET image_count=image_count+1", [group_id])?;
+    conn.execute(
+        r#"
+            INSERT INTO mars_group_stat (group_id, image_count)
+            VALUES (?, 1)
+            ON CONFLICT(group_id) DO UPDATE SET
+                image_count = image_count + 1
+        "#,
+        [group_id],
+    )?;
     if existed.is_none() && group_id < 0 {
-        conn.execute("INSERT INTO mars_stat_meta(key,value) VALUES('group_count',1) ON CONFLICT(key) DO UPDATE SET value=value+1", [])?;
+        conn.execute(
+            r#"
+                INSERT INTO mars_stat_meta (key, value)
+                VALUES ('group_count', 1)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = value + 1
+            "#,
+            [],
+        )?;
     }
     Ok(())
 }

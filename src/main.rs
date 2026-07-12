@@ -18,6 +18,7 @@ use opencv::{
     core::{self, MatTraitConst, Vector},
     imgcodecs, imgproc,
 };
+use r2d2::{ManageConnection, Pool, PooledConnection};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use std::{
     collections::HashMap,
@@ -39,6 +40,7 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 const SCHEMA_VERSION: i64 = 1;
 const GROUP_WAIT: Duration = Duration::from_millis(1500);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const DB_POOL_SIZE: u32 = 8;
 #[derive(Clone, Debug)]
 struct Config {
     token: String,
@@ -223,9 +225,41 @@ fn http_client(config: &Config) -> Result<reqwest::Client> {
     builder.build().context("build HTTP client")
 }
 
+#[derive(Debug)]
+struct SqliteConnectionManager {
+    path: PathBuf,
+}
+
+impl ManageConnection for SqliteConnectionManager {
+    type Connection = Connection;
+    type Error = rusqlite::Error;
+
+    fn connect(&self) -> std::result::Result<Self::Connection, Self::Error> {
+        let conn = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+        )?;
+        conn.busy_timeout(Duration::from_secs(10))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-80000;",
+        )?;
+        Ok(conn)
+    }
+
+    fn is_valid(&self, conn: &mut Self::Connection) -> std::result::Result<(), Self::Error> {
+        conn.execute_batch("SELECT 1")
+    }
+
+    fn has_broken(&self, _: &mut Self::Connection) -> bool {
+        false
+    }
+}
+
 #[derive(Clone)]
 struct Database {
-    path: Arc<PathBuf>,
+    pool: Pool<SqliteConnectionManager>,
 }
 
 #[derive(Clone, Debug)]
@@ -244,28 +278,25 @@ struct Observation {
 
 impl Database {
     async fn open(path: PathBuf) -> Result<Self> {
-        let db = Self {
-            path: Arc::new(path),
-        };
-        let clone = db.clone();
-        spawn_blocking(move || clone.initialize())
-            .await
-            .context("database initialization task")??;
-        Ok(db)
+        spawn_blocking(move || -> Result<Self> {
+            let manager = SqliteConnectionManager { path };
+            let pool = Pool::builder()
+                .max_size(DB_POOL_SIZE)
+                .min_idle(Some(0))
+                .connection_timeout(Duration::from_secs(10))
+                .test_on_check_out(false)
+                .build(manager)
+                .context("create SQLite connection pool")?;
+            let db = Self { pool };
+            db.initialize()?;
+            Ok(db)
+        })
+        .await
+        .context("database initialization task")?
     }
 
-    fn connection(&self) -> Result<Connection> {
-        let conn = Connection::open_with_flags(
-            &*self.path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
-        )?;
-        conn.busy_timeout(Duration::from_secs(10))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-80000;",
-        )?;
-        Ok(conn)
+    fn connection(&self) -> Result<PooledConnection<SqliteConnectionManager>> {
+        self.pool.get().context("get SQLite connection from pool")
     }
 
     fn initialize(&self) -> Result<()> {
@@ -358,14 +389,13 @@ impl Database {
     async fn info(&self, group_id: i64, hash: [u8; 8]) -> Result<MarsInfo> {
         let db = self.clone();
         spawn_blocking(move || -> Result<MarsInfo> {
-            Ok(
-                read_info(&db.connection()?, group_id, hash)?.unwrap_or(MarsInfo {
-                    dhash: hash,
-                    count: 0,
-                    last_msg_id: 0,
-                    in_whitelist: false,
-                }),
-            )
+            let conn = db.connection()?;
+            Ok(read_info(&conn, group_id, hash)?.unwrap_or(MarsInfo {
+                dhash: hash,
+                count: 0,
+                last_msg_id: 0,
+                in_whitelist: false,
+            }))
         })
         .await?
     }
@@ -1175,6 +1205,7 @@ mod tests {
                 .as_nanos()
         ));
         let db = Database::open(path.clone()).await.unwrap();
+        assert_eq!(db.pool.state().connections, 1);
         let hash = [7; 8];
         assert!(db.observe(-100, hash, 10).await.unwrap().previous.is_none());
         assert_eq!(

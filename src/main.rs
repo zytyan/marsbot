@@ -28,7 +28,10 @@ use std::{
     fs::File,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -1470,9 +1473,18 @@ async fn wait_for_shutdown() -> Result<&'static str> {
 
 fn main() -> Result<()> {
     let config = Config::load()?;
+    let worker_threads = config.tokio_worker_threads;
+    let next_thread_id = AtomicUsize::new(0);
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(config.tokio_worker_threads)
+        .worker_threads(worker_threads)
         .max_blocking_threads(config.tokio_max_blocking_threads)
+        .thread_name_fn(move || {
+            if next_thread_id.fetch_add(1, Ordering::Relaxed) < worker_threads {
+                "mars-poll".to_owned()
+            } else {
+                "mars-block".to_owned()
+            }
+        })
         .enable_all()
         .build()
         .context("build Tokio runtime")?;

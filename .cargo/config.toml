@@ -1,5 +1,10 @@
 [env]
-OPENCV_LINK_LIBS = { value = "static=opencv_core,static=opencv_imgcodecs,static=opencv_imgproc,static=libjpeg-turbo", force = true }
+OPENCV_LINK_LIBS = { value = "static=stdc++,static=opencv_core,static=opencv_imgcodecs,static=opencv_imgproc,static=libjpeg-turbo", force = true }
+CXXSTDLIB = ""
 OPENCV_INCLUDE_PATHS = { value = "opencv_static/build/opencv-install/include/opencv4", relative = true, force = true }
 OPENCV_LINK_PATHS = { value = "opencv_static/build/opencv-install/lib", force = true, relative = true }
 SQLITE3_STATIC = "1"
+
+[build]
+# 让由 OpenCV 引入的 C++ 运行时随可执行文件静态链接；不强制静态 glibc。
+rustflags = ["-L", "native=/usr/lib/gcc/x86_64-linux-gnu/14", "-C", "link-arg=-static-libstdc++"]

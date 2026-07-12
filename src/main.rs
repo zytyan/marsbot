@@ -46,70 +46,6 @@ struct Config {
     log_level: String,
     report_stat_url: Option<String>,
     allow_bot_messages: bool,
-    notify_socket: Option<String>,
-    watchdog_usec: Option<u64>,
-    watchdog_pid: Option<u32>,
-}
-
-#[derive(Clone)]
-struct SystemdNotifier {
-    enabled: bool,
-    watchdog_usec: Option<u64>,
-    watchdog_pid: Option<u32>,
-}
-
-impl SystemdNotifier {
-    fn new(config: &Config) -> Self {
-        Self {
-            enabled: config.notify_socket.is_some(),
-            watchdog_usec: config.watchdog_usec,
-            watchdog_pid: config.watchdog_pid,
-        }
-    }
-
-    async fn notify(&self, argument: String) {
-        if !self.enabled {
-            return;
-        }
-        let result = spawn_blocking(move || {
-            Command::new("systemd-notify")
-                .arg("--no-block")
-                .arg(argument)
-                .status()
-        })
-        .await;
-        if !matches!(result, Ok(Ok(status)) if status.success()) {
-            eprintln!("systemd notification failed; ensure systemd-notify is available");
-        }
-    }
-
-    async fn status(&self, status: &str) {
-        self.notify(format!("--status={status}")).await;
-    }
-    async fn ready(&self) {
-        self.notify("--ready".into()).await;
-    }
-
-    fn start_watchdog(&self) {
-        let Some(usec) = self.watchdog_usec else {
-            return;
-        };
-        if self
-            .watchdog_pid
-            .is_some_and(|pid| pid != std::process::id())
-            || !self.enabled
-        {
-            return;
-        }
-        let notifier = self.clone();
-        tokio::spawn(async move {
-            let interval = Duration::from_micros(usec / 2).max(Duration::from_secs(1));
-            loop {
-                sleep(interval).await;
-                notifier.notify("--watchdog".into()).await;
-            }
-        });
-    }
 }
 
 impl Config {
@@ -136,15 +72,6 @@ impl Config {
             log_level: get("LOG_LEVEL").unwrap_or_else(|| "INFO".into()),
             report_stat_url: get("REPORT_STAT_URL"),
             allow_bot_messages,
-            notify_socket: get("NOTIFY_SOCKET"),
-            watchdog_usec: get("WATCHDOG_USEC")
-                .map(|v| v.parse())
-                .transpose()
-                .context("invalid WATCHDOG_USEC")?,
-            watchdog_pid: get("WATCHDOG_PID")
-                .map(|v| v.parse())
-                .transpose()
-                .context("invalid WATCHDOG_PID")?,
         };
         config.validate()?;
         config.print();
@@ -230,30 +157,6 @@ impl Config {
                 self.allow_bot_messages.to_string(),
                 false,
                 "allow messages from other bots",
-            ),
-            (
-                "NOTIFY_SOCKET",
-                self.notify_socket
-                    .clone()
-                    .unwrap_or_else(|| "<unset>".into()),
-                false,
-                "systemd notification socket",
-            ),
-            (
-                "WATCHDOG_USEC",
-                self.watchdog_usec
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "<unset>".into()),
-                false,
-                "systemd watchdog interval",
-            ),
-            (
-                "WATCHDOG_PID",
-                self.watchdog_pid
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "<unset>".into()),
-                false,
-                "systemd watchdog process",
             ),
         ];
         for (name, value, required, purpose) in rows {
@@ -1124,8 +1027,6 @@ fn updates_params(offset: Option<i64>) -> GetUpdatesParams {
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::load()?;
-    let notifier = SystemdNotifier::new(&config);
-    notifier.status("Initializing marsbot").await;
     let http = http_client(&config)?;
     let bot = Bot::builder()
         .api_url(config.api_url())
@@ -1144,15 +1045,11 @@ async fn main() -> Result<()> {
         export_locks: Arc::new(Mutex::new(HashMap::new())),
     };
     eprintln!("marsbot started as id={}", app.self_id);
-    notifier.ready().await;
-    notifier.status("Running").await;
-    notifier.start_watchdog();
     let mut offset: Option<i64> = None;
     loop {
         let params = updates_params(offset);
         tokio::select! { _=signal::ctrl_c()=> { eprintln!("marsbot stopping"); break; }, response=app.bot.get_updates(&params) => match response { Ok(result)=> { for update in result.result { offset=Some(i64::from(update.update_id)+1); let app=app.clone(); tokio::spawn(async move { if let Err(e)=dispatch(app,update).await { eprintln!("update failed: {e:#}"); } }); } }, Err(e)=> { eprintln!("getUpdates failed: {e}"); sleep(Duration::from_secs(2)).await; } } }
     }
-    notifier.status("Stopping").await;
     Ok(())
 }
 

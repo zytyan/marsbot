@@ -296,7 +296,7 @@ impl Database {
 
     async fn hash_for_file(&self, fuid: String) -> Result<Option<[u8; 8]>> {
         let db = self.clone();
-        Ok(spawn_blocking(move || {
+        spawn_blocking(move || {
             let conn = db.connection()?;
             conn.query_row(
                 "SELECT dhash FROM fuid_to_dhash WHERE fuid=?",
@@ -307,7 +307,7 @@ impl Database {
             .map(blob_to_hash)
             .transpose()
         })
-        .await??)
+        .await?
     }
 
     async fn cache_file_hash(&self, fuid: String, hash: [u8; 8]) -> Result<()> {
@@ -326,18 +326,17 @@ impl Database {
     async fn user_whitelisted(&self, group_id: i64, user_id: u64) -> Result<bool> {
         let db = self.clone();
         let user_id = i64::try_from(user_id)?;
-        Ok(spawn_blocking(move || -> Result<bool> { Ok(db.connection()?.query_row("SELECT EXISTS(SELECT 1 FROM group_user_in_whitelist WHERE group_id=? AND user_id=?)", params![group_id, user_id], |r| r.get::<_, i64>(0))? != 0) }).await??)
+        spawn_blocking(move || -> Result<bool> { Ok(db.connection()?.query_row("SELECT EXISTS(SELECT 1 FROM group_user_in_whitelist WHERE group_id=? AND user_id=?)", params![group_id, user_id], |r| r.get::<_, i64>(0))? != 0) }).await?
     }
 
     async fn observe(&self, group_id: i64, hash: [u8; 8], message_id: i32) -> Result<Observation> {
         let db = self.clone();
-        Ok(spawn_blocking(move || -> Result<Observation> {
+        spawn_blocking(move || -> Result<Observation> {
             let mut conn = db.connection()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let existing = read_info(&tx, group_id, hash)?;
-            if let Some(info) = &existing {
-                if info.last_msg_id == message_id || info.in_whitelist { return Ok(Observation { previous: None, ignored: true }); }
-            }
+            if let Some(info) = &existing
+                && (info.last_msg_id == message_id || info.in_whitelist) { return Ok(Observation { previous: None, ignored: true }); }
             let is_new = existing.is_none();
             let mut next = existing.clone().unwrap_or(MarsInfo { dhash: hash, count: 0, last_msg_id: 0, in_whitelist: false });
             let previous = (next.count > 0).then(|| next.clone());
@@ -347,12 +346,12 @@ impl Database {
             if is_new { increase_group_stat(&tx, group_id)?; }
             tx.commit()?;
             Ok(Observation { previous, ignored: false })
-        }).await??)
+        }).await?
     }
 
     async fn info(&self, group_id: i64, hash: [u8; 8]) -> Result<MarsInfo> {
         let db = self.clone();
-        Ok(spawn_blocking(move || -> Result<MarsInfo> {
+        spawn_blocking(move || -> Result<MarsInfo> {
             Ok(
                 read_info(&db.connection()?, group_id, hash)?.unwrap_or(MarsInfo {
                     dhash: hash,
@@ -362,7 +361,7 @@ impl Database {
                 }),
             )
         })
-        .await??)
+        .await?
     }
 
     async fn set_image_whitelist(&self, group_id: i64, hash: [u8; 8], enabled: bool) -> Result<()> {
@@ -374,17 +373,17 @@ impl Database {
     async fn set_user_whitelist(&self, group_id: i64, user_id: u64, enabled: bool) -> Result<bool> {
         let db = self.clone();
         let user_id = i64::try_from(user_id)?;
-        Ok(spawn_blocking(move || -> Result<bool> { let conn = db.connection()?; let n = if enabled { conn.execute("INSERT INTO group_user_in_whitelist(group_id,user_id) VALUES(?,?) ON CONFLICT DO NOTHING", params![group_id,user_id])? } else { conn.execute("DELETE FROM group_user_in_whitelist WHERE group_id=? AND user_id=?", params![group_id,user_id])? }; Ok(n != 0) }).await??)
+        spawn_blocking(move || -> Result<bool> { let conn = db.connection()?; let n = if enabled { conn.execute("INSERT INTO group_user_in_whitelist(group_id,user_id) VALUES(?,?) ON CONFLICT DO NOTHING", params![group_id,user_id])? } else { conn.execute("DELETE FROM group_user_in_whitelist WHERE group_id=? AND user_id=?", params![group_id,user_id])? }; Ok(n != 0) }).await?
     }
 
     async fn stats(&self, group_id: i64) -> Result<(i64, i64)> {
         let db = self.clone();
-        Ok(spawn_blocking(move || -> Result<(i64,i64)> { let conn = db.connection()?; let groups = conn.query_row("SELECT COALESCE((SELECT value FROM mars_stat_meta WHERE key='group_count'),(SELECT COUNT(*) FROM mars_group_stat WHERE group_id < 0))", [], |r| r.get(0))?; let images = conn.query_row("SELECT COALESCE((SELECT image_count FROM mars_group_stat WHERE group_id=?),0)", [group_id], |r| r.get(0))?; Ok((groups,images)) }).await??)
+        spawn_blocking(move || -> Result<(i64,i64)> { let conn = db.connection()?; let groups = conn.query_row("SELECT COALESCE((SELECT value FROM mars_stat_meta WHERE key='group_count'),(SELECT COUNT(*) FROM mars_group_stat WHERE group_id < 0))", [], |r| r.get(0))?; let images = conn.query_row("SELECT COALESCE((SELECT image_count FROM mars_group_stat WHERE group_id=?),0)", [group_id], |r| r.get(0))?; Ok((groups,images)) }).await?
     }
 
     async fn similar(&self, group_id: i64, hash: [u8; 8]) -> Result<Vec<(MarsInfo, u32)>> {
         let db = self.clone();
-        Ok(spawn_blocking(move || -> Result<Vec<(MarsInfo, u32)>> {
+        spawn_blocking(move || -> Result<Vec<(MarsInfo, u32)>> {
             let conn = db.connection()?;
             let mut st = conn.prepare(
                 "SELECT pic_dhash,count,last_msg_id,in_whitelist FROM mars_info WHERE group_id=?",
@@ -417,12 +416,12 @@ impl Database {
             out.truncate(10);
             Ok(out)
         })
-        .await??)
+        .await?
     }
 
     async fn export_csv(&self, group_id: i64) -> Result<String> {
         let db = self.clone();
-        Ok(spawn_blocking(move || -> Result<String> { let conn = db.connection()?; let mut text = String::from("group_id,pic_dhash,count,last_msg_id,in_whitelist\n"); let mut st = conn.prepare("SELECT pic_dhash,count,last_msg_id,in_whitelist FROM mars_info WHERE group_id=? ORDER BY pic_dhash")?; let rows = st.query_map([group_id], |r| Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,i64>(1)?,r.get::<_,i32>(2)?,r.get::<_,i64>(3)?)))?; for row in rows { let (hash,count,msg,white)=row?; text.push_str(&format!("{group_id},{},{count},{msg},{white}\n", hex(&hash))); } Ok(text) }).await??)
+        spawn_blocking(move || -> Result<String> { let conn = db.connection()?; let mut text = String::from("group_id,pic_dhash,count,last_msg_id,in_whitelist\n"); let mut st = conn.prepare("SELECT pic_dhash,count,last_msg_id,in_whitelist FROM mars_info WHERE group_id=? ORDER BY pic_dhash")?; let rows = st.query_map([group_id], |r| Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,i64>(1)?,r.get::<_,i32>(2)?,r.get::<_,i64>(3)?)))?; for row in rows { let (hash,count,msg,white)=row?; text.push_str(&format!("{group_id},{},{count},{msg},{white}\n", hex(&hash))); } Ok(text) }).await?
     }
 }
 
@@ -617,11 +616,10 @@ impl App {
     }
 
     async fn handle_photo(&self, event: PhotoEvent) -> Result<Option<(PhotoEvent, MarsInfo)>> {
-        if let Some(user_id) = event.user_id {
-            if self.db.user_whitelisted(event.chat.id, user_id).await? {
+        if let Some(user_id) = event.user_id
+            && self.db.user_whitelisted(event.chat.id, user_id).await? {
                 return Ok(None);
             }
-        }
         let hash = self.file_hash(&event).await?;
         let observed = self
             .db
@@ -705,11 +703,10 @@ impl App {
             .unwrap_or_default();
         let mut best: Option<(PhotoEvent, MarsInfo)> = None;
         for event in events {
-            if let Some((event, previous)) = self.handle_photo(event).await? {
-                if best.as_ref().is_none_or(|(_, p)| previous.count > p.count) {
+            if let Some((event, previous)) = self.handle_photo(event).await?
+                && best.as_ref().is_none_or(|(_, p)| previous.count > p.count) {
                     best = Some((event, previous));
                 }
-            }
         }
         if let Some((event, previous)) = best {
             self.maybe_report(event.chat.id, previous.count).await;
@@ -828,11 +825,11 @@ impl App {
                 .export_locks
                 .lock()
                 .map_err(|_| anyhow!("export lock poisoned"))?;
-            if locks.contains_key(&chat_id) {
-                true
-            } else {
-                locks.insert(chat_id, true);
+            if let std::collections::hash_map::Entry::Vacant(e) = locks.entry(chat_id) {
+                e.insert(true);
                 false
+            } else {
+                true
             }
         };
         if busy {

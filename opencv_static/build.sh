@@ -7,5 +7,5 @@ cmake -S . -B build \
 cmake --build build --parallel
 
 cmake --install build --prefix "$PWD/build/opencv-install"
-cp build/opencv-install/lib/opencv4/3rdparty/liblibjpeg-turbo.a build/opencv-install/lib
-cp build/opencv-install/lib/opencv4/3rdparty/liblibjpeg-turbo.a build/opencv-install/lib/libjpeg-turbo.a
+ln -s build/opencv-install/lib/opencv4/3rdparty/liblibjpeg-turbo.a build/opencv-install/lib
+ln -s build/opencv-install/lib/opencv4/3rdparty/liblibjpeg-turbo.a build/opencv-install/lib/libjpeg-turbo.a

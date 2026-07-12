@@ -10,7 +10,7 @@ use frankenstein::{
     types::{
         AllowedUpdate, CallbackQuery, Chat, ChatId, ChatMember, ChatMemberUpdated, ChatType,
         InlineKeyboardButton, InlineKeyboardMarkup, MaybeInaccessibleMessage, Message, ReplyMarkup,
-        ReplyParameters,
+        ReplyParameters, User,
     },
     updates::{Update, UpdateContent},
 };
@@ -27,7 +27,7 @@ use std::{
     io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     signal,
@@ -59,7 +59,7 @@ struct Config {
 impl Config {
     fn load() -> Result<Self> {
         let get = |name: &str| env::var(name).ok().filter(|v| !v.is_empty());
-        let token = get("BOT_TOKEN").ok_or_else(|| anyhow!("BOT_TOKEN is required"))?;
+        let token = get("BOT_TOKEN").unwrap_or_else(|| "".into());
         let allow_bot_messages = get("ALLOW_BOT_MESSAGES")
             .as_deref()
             .map(parse_bool)
@@ -81,12 +81,15 @@ impl Config {
             report_stat_url: get("REPORT_STAT_URL"),
             allow_bot_messages,
         };
-        config.validate()?;
         config.print();
+        config.validate()?;
         Ok(config)
     }
 
     fn validate(&self) -> Result<()> {
+        if self.token.is_empty() {
+            anyhow::bail!("BOT_TOKEN is required");
+        }
         for (name, value, suffix) in [
             ("BOT_API_URL", &self.api_prefix, "/bot"),
             ("BOT_FILE_URL", &self.file_prefix, "/file/bot"),
@@ -168,7 +171,7 @@ impl Config {
             ),
         ];
         for (name, value, required, purpose) in rows {
-            eprintln!("config {name}: value={value}; required={required}; purpose={purpose}");
+            eprintln!("{name}: value={value}; required={required}; purpose={purpose}");
         }
     }
 
@@ -200,7 +203,7 @@ fn mask(value: &str) -> String {
     format!(
         "{}{}{}",
         chars[..4].iter().collect::<String>(),
-        "*".repeat(chars.len() - 8),
+        "****",
         chars[chars.len() - 4..].iter().collect::<String>()
     )
 }
@@ -554,12 +557,7 @@ impl Database {
         spawn_blocking(move || -> Result<(i64, i64)> {
             let conn = db.connection()?;
             let groups = conn.query_row(
-                r#"
-                    SELECT COALESCE(
-                        (SELECT value FROM mars_stat_meta WHERE key = 'group_count'),
-                        (SELECT COUNT(*) FROM mars_group_stat WHERE group_id < 0)
-                    )
-                "#,
+                r#"SELECT COUNT(*) FROM mars_group_stat WHERE group_id < 0"#,
                 [],
                 |row| row.get(0),
             )?;
@@ -1014,10 +1012,15 @@ impl App {
         match command {
             "help" | "start" => {
                 if matches!(message.chat.type_field, ChatType::Private) || command == "help" {
+                    let username = if matches!(message.chat.type_field, ChatType::Private) {
+                        None
+                    } else {
+                        self.self_username.as_deref()
+                    };
                     self.reply(
                         chat_id,
                         message.message_id,
-                        help_text(self.self_username.as_deref()),
+                        help_text(username),
                         false,
                         None,
                     )
@@ -1025,16 +1028,20 @@ impl App {
                 }
             }
             "stat" => {
+                let started = Instant::now();
                 let (groups, images) = self.db.stats(chat_id).await?;
                 let user = message.from.as_ref();
                 let white = match user {
                     Some(user) => self.db.user_whitelisted(chat_id, user.id).await?,
                     None => false,
                 };
-                let name = user.map(|user| user.first_name.as_str()).unwrap_or("unknown");
+                let identity = user
+                    .map(|user| format!("{}(id:{})", user_full_name(user), user.id))
+                    .unwrap_or_else(|| "unknown".into());
                 let text = format!(
-                    "火星车当前一共服务了{groups}个群组\n当前群组ID: {chat_id}\n您是 {name}，您{}本群白名单当中\n本群一共记录了 {images} 张不同的图片\n火星车与您同在",
-                    if white { "在" } else { "不在" }
+                    "火星车当前一共服务了{groups}个群组\n当前群组ID: {chat_id}\n您是 {identity}，您{}本群的白名单当中\n本群一共记录了 {images} 张不同的图片\n本次统计共耗时 {:.2} ms\n火星车与您同在",
+                    if white { "在" } else { "不在" },
+                    started.elapsed().as_secs_f64() * 1000.0,
                 );
                 self.reply(chat_id, message.message_id, text, false, None)
                     .await?;
@@ -1105,10 +1112,22 @@ impl App {
                         .set_user_whitelist(chat_id, user.id, command == "add_me_to_whitelist")
                         .await?;
                     let text = match (command, added) {
-                        ("add_me_to_whitelist", true) => "已将您加入白名单，您发的图片不会被处理。",
-                        ("add_me_to_whitelist", false) => "您已经在本群白名单中。",
-                        ("remove_me_from_whitelist", true) => "已将您移出白名单，火星车会继续工作。",
-                        _ => "您不在本群白名单中，火星车正在工作。",
+                        ("add_me_to_whitelist", true) => format!(
+                            "已将用户 {} 加入白名单，您发的任何图片都不会被处理。",
+                            user_full_name(user)
+                        ),
+                        ("add_me_to_whitelist", false) => format!(
+                            "用户 {} 已经在本群的白名单中，您发的任何图片都不会被处理。",
+                            user_full_name(user)
+                        ),
+                        ("remove_me_from_whitelist", true) => format!(
+                            "已将用户 {} 移除本群白名单，火星车会继续为您服务。",
+                            user_full_name(user)
+                        ),
+                        _ => format!(
+                            "用户 {} 不在本群白名单中，火星车正在工作。",
+                            user_full_name(user)
+                        ),
                     };
                     self.reply(chat_id, message.message_id, text, false, None)
                         .await?;
@@ -1232,7 +1251,24 @@ impl App {
             .await?;
             return Ok(());
         }
-        let path = self.db.export_zip(chat_id).await?;
+        let path = match self.db.export_zip(chat_id).await {
+            Ok(path) => path,
+            Err(error) => {
+                self.export_locks
+                    .lock()
+                    .map_err(|_| anyhow!("export lock poisoned"))?
+                    .remove(&chat_id);
+                self.reply(
+                    chat_id,
+                    message_id,
+                    format!("导出失败，错误: {error}"),
+                    false,
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
         let result = self
             .bot
             .send_document(
@@ -1249,7 +1285,15 @@ impl App {
                 .lock()
                 .map_err(|_| anyhow!("export lock poisoned"))?
                 .remove(&chat_id);
-            return Err(error.into());
+            self.reply(
+                chat_id,
+                message_id,
+                format!("导出失败，错误: {error}"),
+                false,
+                None,
+            )
+            .await?;
+            return Ok(());
         }
         let locks = self.export_locks.clone();
         tokio::spawn(async move {
@@ -1294,6 +1338,12 @@ fn parse_command<'a>(text: &'a str, username: Option<&str>) -> Option<&'a str> {
         return None;
     }
     Some(name)
+}
+fn user_full_name(user: &User) -> String {
+    match user.last_name.as_deref().filter(|name| !name.is_empty()) {
+        Some(last_name) => format!("{} {last_name}", user.first_name),
+        None => user.first_name.clone(),
+    }
 }
 fn reply_text(chat: &Chat, info: &MarsInfo, grouped: bool) -> String {
     let (s, e) = link(chat, info.last_msg_id);
@@ -1506,7 +1556,7 @@ mod tests {
     use std::io::Read;
     #[test]
     fn masking_keeps_edges() {
-        assert_eq!(mask("1234567890"), "1234**7890");
+        assert_eq!(mask("1234567890"), "1234****7890");
     }
     #[test]
     fn parse_hash_roundtrip() {

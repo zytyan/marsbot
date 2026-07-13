@@ -19,10 +19,11 @@ env:
   CARGO_HOME: ${{ github.workspace }}/.ci-cache/cargo
   RUSTUP_HOME: ${{ github.workspace }}/.ci-cache/rustup
   CARGO_TERM_COLOR: always
-  CC: clang
-  CXX: clang++
-  LIBCLANG_PATH: /usr/lib/llvm-7/lib
-  LLVM_CONFIG_PATH: /usr/bin/llvm-config-7
+  CC: clang-11
+  CXX: clang++-11
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang++-11
+  LIBCLANG_PATH: /usr/lib/llvm-11/lib
+  LLVM_CONFIG_PATH: /usr/bin/llvm-config-11
 
 jobs:
   build:
@@ -39,15 +40,18 @@ jobs:
           set -euo pipefail
           printf '%s\n' \
             'deb http://archive.debian.org/debian buster main' \
+            'deb http://archive.debian.org/debian buster-backports main' \
             'deb http://archive.debian.org/debian-security buster/updates main' \
             > /etc/apt/sources.list
           printf 'Acquire::Check-Valid-Until "false";\n' \
             > /etc/apt/apt.conf.d/99archive
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils build-essential ca-certificates clang curl file git \
-            libclang-7-dev libstdc++-8-dev llvm-7-dev ninja-build pkg-config \
-            xz-utils zstd
+            binutils build-essential ca-certificates curl file git \
+            libstdc++-8-dev ninja-build pkg-config xz-utils zstd
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            --target-release buster-backports \
+            clang-11 libclang-11-dev llvm-11-dev
           rm -rf /var/lib/apt/lists/*
 
           cmake_archive=cmake-3.31.6-linux-x86_64.tar.gz
@@ -85,7 +89,7 @@ jobs:
             --component clippy --component rustfmt
           rustup default 1.97.0
           rustc --version --verbose
-          clang --version | head -n 1
+          "$CC" --version | head -n 1
 
       - name: Save Rust toolchain
         if: steps.rustup-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
@@ -100,7 +104,7 @@ jobs:
         with:
           path: opencv_static/build/opencv-install
           key: >-
-            opencv-debian10-x86_64-clang7-4.12.0-${{
+            opencv-debian10-x86_64-clang11-4.12.0-${{
             hashFiles('opencv_static/CMakeLists.txt', 'opencv_static/build.sh') }}
 
       - name: Build static OpenCV
@@ -108,7 +112,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CC=clang CXX=clang++ ./opencv_static/build.sh
+          ./opencv_static/build.sh
 
       - name: Save OpenCV
         if: steps.opencv-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
@@ -126,12 +130,12 @@ jobs:
             ${{ env.CARGO_HOME }}/git
             target
           key: >-
-            rust-debian10-x86_64-clang7-${{
+            rust-debian10-x86_64-clang11-${{
             hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml',
             'opencv_static/CMakeLists.txt', 'opencv_static/build.sh') }}-${{ github.sha }}
           restore-keys: |
-            rust-debian10-x86_64-clang7-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'opencv_static/CMakeLists.txt', 'opencv_static/build.sh') }}-
-            rust-debian10-x86_64-clang7-
+            rust-debian10-x86_64-clang11-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'opencv_static/CMakeLists.txt', 'opencv_static/build.sh') }}-
+            rust-debian10-x86_64-clang11-
 
       - name: Check, test, and build
         shell: bash

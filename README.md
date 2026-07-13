@@ -22,8 +22,8 @@ cargo build --release
 
 `.cargo/config.toml` 会静态链接 `opencv_core`、`opencv_imgcodecs`、`opencv_imgproc`、`libjpeg-turbo`、bundled SQLite 以及 C++ 标准库 `libstdc++`。它不强制静态链接 glibc 和其他系统运行库。
 
-OpenCV 和 Rust 最终链接默认使用 Clang。GitHub Actions 在 Debian 10
-环境构建通用 Linux x86_64 产物，并拒绝任何要求高于 glibc 2.28 的二进制。
+OpenCV 和 Rust 最终链接默认使用 Clang。GitHub Actions 在 Debian 12
+环境构建通用 Linux x86_64 产物，并拒绝任何要求高于 glibc 2.36 的二进制。
 
 可用下列命令确认不会加载动态 OpenCV 或动态 C++ 标准库：
 
@@ -84,7 +84,7 @@ cargo build --release
 ```
 
 推送与 `Cargo.toml` 版本一致的标签（例如 `v0.1.0`）会自动创建 GitHub
-Release，并发布 `marsbot-0.1.0-linux-x86_64-glibc2.28.tar.gz` 及其 SHA-256
+Release，并发布 `marsbot-0.1.0-linux-x86_64-glibc2.36.tar.gz` 及其 SHA-256
 校验文件。
 
 要进行群内实测，使用测试 Bot 启动程序并设置 `ALLOW_BOT_MESSAGES=true`，再由另一个 Bot 用 curl 向测试群发送命令或同一图片两次。生产 Bot 保持默认值 `false`，避免 Bot 之间形成循环。

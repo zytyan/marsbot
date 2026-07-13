@@ -1,3 +1,5 @@
 /target
 /pymarsbot
 /opencv_static/build
+/.ci-cache
+/dist

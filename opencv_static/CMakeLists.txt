@@ -15,15 +15,6 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 # 对普通 Rust 可执行文件也没有坏处。
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# 默认安装到 build/opencv-install
-# 也可以在 cmake 命令行通过 -DCMAKE_INSTALL_PREFIX=... 覆盖
-set(
-    CMAKE_INSTALL_PREFIX
-    "${CMAKE_BINARY_DIR}/opencv-install"
-    CACHE PATH ""
-    FORCE
-)
-
 # ------------------------------------------------------------
 # 只编译需要的 OpenCV 模块
 # ------------------------------------------------------------

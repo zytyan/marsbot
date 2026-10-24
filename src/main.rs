@@ -1,4 +1,10 @@
 mod db_pool;
+mod telemetry;
+#[cfg(test)]
+mod telemetry_integration_tests;
+#[cfg(test)]
+mod test_support;
+use telemetry::{CompletionGuard, Trace};
 
 use anyhow::{Context, Result, anyhow};
 use db_pool::{PooledConnection, SqlitePool};
@@ -50,6 +56,7 @@ const DEFAULT_TOKIO_MAX_BLOCKING_THREADS: usize = 4;
 #[derive(Clone, Debug)]
 struct Config {
     token: String,
+    slow_message_alert_chat_id: Option<i64>,
     api_prefix: String,
     file_prefix: String,
     bot_proxy: Option<String>,
@@ -85,6 +92,12 @@ impl Config {
         )?;
         let config = Self {
             token,
+            slow_message_alert_chat_id: get("SLOW_MESSAGE_ALERT_CHAT_ID")
+                .map(|v| {
+                    v.parse::<i64>()
+                        .context("SLOW_MESSAGE_ALERT_CHAT_ID must be a positive private chat ID")
+                })
+                .transpose()?,
             api_prefix: get("BOT_API_URL").unwrap_or_else(|| "https://api.telegram.org/bot".into()),
             file_prefix: get("BOT_FILE_URL")
                 .unwrap_or_else(|| "https://api.telegram.org/file/bot".into()),
@@ -107,6 +120,9 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.slow_message_alert_chat_id.is_some_and(|id| id <= 0) {
+            anyhow::bail!("SLOW_MESSAGE_ALERT_CHAT_ID must be a positive private chat ID");
+        }
         if self.token.is_empty() {
             anyhow::bail!("BOT_TOKEN is required");
         }
@@ -128,6 +144,14 @@ impl Config {
 
     fn print(&self) {
         let rows = [
+            (
+                "SLOW_MESSAGE_ALERT_CHAT_ID",
+                self.slow_message_alert_chat_id
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "<unset: private alerts disabled>".into()),
+                false,
+                "private chat for slow message alerts",
+            ),
             ("BOT_TOKEN", mask(&self.token), true, "Telegram Bot token"),
             (
                 "BOT_API_URL",
@@ -262,9 +286,13 @@ fn show_url_secret(value: Option<&str>) -> String {
 }
 
 fn http_client(config: &Config) -> Result<reqwest::Client> {
+    http_client_timeout(config, Duration::from_secs(90))
+}
+
+fn http_client_timeout(config: &Config, request_timeout: Duration) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(90));
+        .timeout(request_timeout);
     if let Some(proxy) = &config.bot_proxy {
         builder = builder
             .no_proxy()
@@ -276,6 +304,7 @@ fn http_client(config: &Config) -> Result<reqwest::Client> {
 #[derive(Clone)]
 struct Database {
     pool: SqlitePool,
+    trace: Option<Trace>,
 }
 
 #[derive(Clone, Debug)]
@@ -296,21 +325,47 @@ impl Database {
     async fn open(path: PathBuf, pool_size: usize) -> Result<Self> {
         let db = Self {
             pool: SqlitePool::new(path, pool_size)?,
+            trace: None,
         };
         db.initialize().await?;
         Ok(db)
     }
 
     async fn connection(&self) -> Result<PooledConnection> {
+        self.stage("database");
+        let _timer = self.trace.as_ref().map(|t| t.timer("db_pool_wait_ms"));
         self.pool
             .get()
             .await
             .context("get SQLite connection from pool")
     }
 
+    fn stage(&self, stage: &'static str) {
+        if let Some(t) = &self.trace {
+            t.stage(stage);
+        }
+    }
+    fn blocking<F, T>(&self, f: F) -> tokio::task::JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.stage("db_blocking_queue");
+        let queue = self.trace.as_ref().map(|t| t.timer("db_blocking_queue_ms"));
+        let trace = self.trace.clone();
+        spawn_blocking(move || {
+            drop(queue);
+            if let Some(t) = &trace {
+                t.stage("db_execute");
+            }
+            let _execution = trace.as_ref().map(|t| t.timer("db_execution_ms"));
+            f()
+        })
+    }
+
     async fn initialize(&self) -> Result<()> {
         let conn = self.connection().await?;
-        spawn_blocking(move || -> Result<()> {
+        self.blocking(move || -> Result<()> {
             conn.execute_batch(
                 r#"
                 CREATE TABLE IF NOT EXISTS mars_info (
@@ -398,7 +453,7 @@ impl Database {
 
     async fn hash_for_file(&self, fuid: String) -> Result<Option<[u8; 8]>> {
         let conn = self.connection().await?;
-        spawn_blocking(move || {
+        self.blocking(move || {
             conn.query_row(
                 "SELECT dhash FROM fuid_to_dhash WHERE fuid=?",
                 [fuid],
@@ -413,7 +468,7 @@ impl Database {
 
     async fn cache_file_hash(&self, fuid: String, hash: [u8; 8]) -> Result<()> {
         let conn = self.connection().await?;
-        spawn_blocking(move || -> Result<()> {
+        self.blocking(move || -> Result<()> {
             conn.execute(
                 r#"
                     INSERT INTO fuid_to_dhash (fuid, dhash)
@@ -431,7 +486,7 @@ impl Database {
     async fn user_whitelisted(&self, group_id: i64, user_id: u64) -> Result<bool> {
         let user_id = i64::try_from(user_id)?;
         let conn = self.connection().await?;
-        spawn_blocking(move || -> Result<bool> {
+        self.blocking(move || -> Result<bool> {
             Ok(conn.query_row(
                 r#"
                     SELECT EXISTS(
@@ -449,7 +504,7 @@ impl Database {
 
     async fn observe(&self, group_id: i64, hash: [u8; 8], message_id: i32) -> Result<Observation> {
         let mut conn = self.connection().await?;
-        spawn_blocking(move || -> Result<Observation> {
+        self.blocking(move || -> Result<Observation> {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let existing = read_info(&tx, group_id, hash)?;
             if let Some(info) = &existing
@@ -501,7 +556,7 @@ impl Database {
 
     async fn info(&self, group_id: i64, hash: [u8; 8]) -> Result<MarsInfo> {
         let conn = self.connection().await?;
-        spawn_blocking(move || -> Result<MarsInfo> {
+        self.blocking(move || -> Result<MarsInfo> {
             Ok(read_info(&conn, group_id, hash)?.unwrap_or(MarsInfo {
                 dhash: hash,
                 count: 0,
@@ -514,7 +569,7 @@ impl Database {
 
     async fn set_image_whitelist(&self, group_id: i64, hash: [u8; 8], enabled: bool) -> Result<()> {
         let conn = self.connection().await?;
-        spawn_blocking(move || -> Result<()> {
+        self.blocking(move || -> Result<()> {
             conn.execute(
                 r#"
                     INSERT INTO mars_info (group_id, pic_dhash, count, last_msg_id, in_whitelist)
@@ -533,7 +588,7 @@ impl Database {
     async fn set_user_whitelist(&self, group_id: i64, user_id: u64, enabled: bool) -> Result<bool> {
         let user_id = i64::try_from(user_id)?;
         let conn = self.connection().await?;
-        spawn_blocking(move || -> Result<bool> {
+        self.blocking(move || -> Result<bool> {
             let changed = if enabled {
                 conn.execute(
                     r#"
@@ -559,7 +614,7 @@ impl Database {
 
     async fn stats(&self, group_id: i64) -> Result<(i64, i64)> {
         let conn = self.connection().await?;
-        spawn_blocking(move || -> Result<(i64, i64)> {
+        self.blocking(move || -> Result<(i64, i64)> {
             let groups = conn.query_row(
                 r#"SELECT COUNT(*) FROM mars_group_stat WHERE group_id < 0"#,
                 [],
@@ -582,7 +637,7 @@ impl Database {
 
     async fn similar(&self, group_id: i64, hash: [u8; 8]) -> Result<Vec<(MarsInfo, u32)>> {
         let conn = self.connection().await?;
-        spawn_blocking(move || -> Result<Vec<(MarsInfo, u32)>> {
+        self.blocking(move || -> Result<Vec<(MarsInfo, u32)>> {
             let mut st = conn.prepare(
                 r#"
                     SELECT pic_dhash, count, last_msg_id, in_whitelist
@@ -623,10 +678,22 @@ impl Database {
 
     async fn export_zip(&self, group_id: i64) -> Result<PathBuf> {
         let conn = self.connection().await?;
-        spawn_blocking(move || Self::write_export_zip(group_id, conn)).await?
+        {
+            let queue = self.trace.as_ref().map(|t| t.timer("db_blocking_queue_ms"));
+            let trace = self.trace.clone();
+            spawn_blocking(move || {
+                drop(queue);
+                Self::write_export_zip(group_id, conn, trace)
+            })
+            .await?
+        }
     }
 
-    fn write_export_zip(group_id: i64, conn: PooledConnection) -> Result<PathBuf> {
+    fn write_export_zip(
+        group_id: i64,
+        conn: PooledConnection,
+        trace: Option<Trace>,
+    ) -> Result<PathBuf> {
         let archive = env::temp_dir().join(format!("mars-export-{group_id}.zip"));
         let result = (|| -> Result<()> {
             let file = File::create(&archive).context("create export ZIP")?;
@@ -638,6 +705,7 @@ impl Database {
                 .context("start CSV in export ZIP")?;
             writeln!(zip, "group_id,pic_dhash,count,last_msg_id,in_whitelist")?;
 
+            let prepare_timer = trace.as_ref().map(|t| t.timer("db_execution_ms"));
             let mut statement = conn.prepare(
                 r#"
                     SELECT pic_dhash, count, last_msg_id, in_whitelist
@@ -654,7 +722,13 @@ impl Database {
                     row.get::<_, i64>(3)?,
                 ))
             })?;
-            for row in rows {
+            drop(prepare_timer);
+            let mut rows = rows;
+            loop {
+                let timer = trace.as_ref().map(|t| t.timer("db_execution_ms"));
+                let row = rows.next();
+                drop(timer);
+                let Some(row) = row else { break };
                 let (hash, count, message_id, in_whitelist) = row?;
                 writeln!(
                     zip,
@@ -675,17 +749,18 @@ impl Database {
 
     async fn checkpoint(&self) -> Result<()> {
         let conn = self.connection().await?;
-        let (busy, log_frames, checkpointed_frames) = spawn_blocking(move || -> Result<_> {
-            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
+        let (busy, log_frames, checkpointed_frames) = self
+            .blocking(move || -> Result<_> {
+                conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(Into::into)
             })
-            .map_err(Into::into)
-        })
-        .await??;
+            .await??;
         if busy != 0 {
             return Err(anyhow!(
                 "WAL checkpoint remained busy after checkpointing {checkpointed_frames}/{log_frames} frame(s)"
@@ -789,6 +864,7 @@ fn dhash(bytes: Vec<u8>) -> Result<[u8; 8]> {
 
 #[derive(Clone)]
 struct App {
+    trace: Option<Trace>,
     bot: Bot,
     http: reqwest::Client,
     config: Config,
@@ -801,6 +877,7 @@ struct App {
 }
 #[derive(Clone)]
 struct PhotoEvent {
+    trace: Option<Trace>,
     chat: Chat,
     message_id: i32,
     user_id: Option<u64>,
@@ -808,7 +885,43 @@ struct PhotoEvent {
     file_unique_id: String,
 }
 
+// Own the pending group even while its aggregation timer is waiting.
+struct PendingAlbumGuard {
+    armed: bool,
+    groups: Arc<Mutex<HashMap<String, Vec<PhotoEvent>>>>,
+    key: String,
+}
+impl Drop for PendingAlbumGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let events = self
+            .groups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key)
+            .unwrap_or_default();
+        for event in events {
+            if let Some(t) = event.trace {
+                t.finish(Some("album aggregation cancelled or panicked".into()));
+            }
+        }
+    }
+}
+
 impl App {
+    fn traced(&self, trace: Option<Trace>) -> Self {
+        let mut app = self.clone();
+        app.trace = trace.clone();
+        app.db.trace = trace;
+        app
+    }
+    fn stage(&self, stage: &'static str) {
+        if let Some(t) = &self.trace {
+            t.stage(stage);
+        }
+    }
     async fn reply(
         &self,
         chat_id: i64,
@@ -824,20 +937,29 @@ impl App {
             .text(text)
             .reply_parameters(reply)
             .build();
+        message.message_thread_id = self.trace.as_ref().and_then(Trace::thread_id);
         if let Some(k) = keyboard {
             message.reply_markup = Some(ReplyMarkup::InlineKeyboardMarkup(k));
         }
         if html {
             message.parse_mode = Some(ParseMode::Html);
         }
-        self.bot.send_message(&message).await?;
+        self.stage("reply");
+        let result = self.bot.send_message(&message).await?.result;
+        if let Some(t) = &self.trace {
+            t.reply(&result, message_id);
+        }
         Ok(())
     }
 
     async fn file_hash(&self, event: &PhotoEvent) -> Result<[u8; 8]> {
         if let Some(hash) = self.db.hash_for_file(event.file_unique_id.clone()).await? {
+            if let Some(t) = &self.trace {
+                t.hash(&hash);
+            }
             return Ok(hash);
         }
+        self.stage("get_file");
         let remote = self
             .bot
             .get_file(
@@ -850,6 +972,7 @@ impl App {
         let path = remote
             .file_path
             .ok_or_else(|| anyhow!("getFile did not return file_path"))?;
+        self.stage("file_download");
         let bytes = if path.starts_with("http://") || path.starts_with("https://") {
             self.http
                 .get(path)
@@ -873,7 +996,11 @@ impl App {
                 .await?
                 .to_vec()
         };
+        self.stage("dhash");
         let hash = spawn_blocking(move || dhash(bytes)).await??;
+        if let Some(t) = &self.trace {
+            t.hash(&hash);
+        }
         self.db
             .cache_file_hash(event.file_unique_id.clone(), hash)
             .await?;
@@ -881,6 +1008,7 @@ impl App {
     }
 
     async fn handle_photo(&self, event: PhotoEvent) -> Result<Option<(PhotoEvent, MarsInfo)>> {
+        self.stage("photo");
         if let Some(user_id) = event.user_id
             && self.db.user_whitelisted(event.chat.id, user_id).await?
         {
@@ -907,6 +1035,9 @@ impl App {
             .as_ref()
             .is_some_and(|u| u.id == self.self_id || (u.is_bot && !self.config.allow_bot_messages))
         {
+            if let Some(t) = &self.trace {
+                t.ignored();
+            }
             return Ok(());
         }
         if let Some(text) = &message.text {
@@ -919,6 +1050,7 @@ impl App {
             return Ok(());
         };
         let event = PhotoEvent {
+            trace: self.trace.clone(),
             chat: (*message.chat).clone(),
             message_id: message.message_id,
             user_id: message.from.as_ref().map(|u| u.id),
@@ -934,13 +1066,23 @@ impl App {
                 .lock()
                 .map_err(|_| anyhow!("media group lock poisoned"))?;
             let first = !groups.contains_key(group);
+            if let Some(t) = &event.trace {
+                t.defer();
+            }
             groups.entry(group.clone()).or_default().push(event);
             drop(groups);
             if first {
                 let app = self.clone();
                 let key = group.clone();
+                let pending = PendingAlbumGuard {
+                    armed: true,
+                    groups: self.media_groups.clone(),
+                    key: key.clone(),
+                };
                 self.tasks.spawn(async move {
+                    let mut pending = pending;
                     sleep(GROUP_WAIT).await;
+                    pending.armed = false;
                     if let Err(e) = app.process_group(key).await {
                         eprintln!("media group error: {e:#}");
                     }
@@ -967,29 +1109,58 @@ impl App {
             .map_err(|_| anyhow!("media group lock poisoned"))?
             .remove(&group)
             .unwrap_or_default();
-        let mut best: Option<(PhotoEvent, MarsInfo)> = None;
-        for event in events {
-            if let Some((event, previous)) = self.handle_photo(event).await?
-                && best.as_ref().is_none_or(|(_, p)| previous.count > p.count)
-            {
-                best = Some((event, previous));
+        let traces = events
+            .iter()
+            .filter_map(|e| e.trace.clone())
+            .collect::<Vec<_>>();
+        let _guards = telemetry::AlbumCompletionGuard(traces.clone());
+        let result: Result<()> = async {
+            let mut best: Option<(PhotoEvent, MarsInfo)> = None;
+            for event in events {
+                let app = self.traced(event.trace.clone());
+                if let Some((event, previous)) = app.handle_photo(event).await?
+                    && best.as_ref().is_none_or(|(_, p)| previous.count > p.count)
+                {
+                    best = Some((event, previous));
+                }
             }
+            if let Some((event, previous)) = best {
+                let app = self.traced(event.trace.clone());
+                app.maybe_report(event.chat.id, previous.count).await;
+                let reply = ReplyParameters::builder()
+                    .message_id(event.message_id)
+                    .build();
+                let mut params = SendMessageParams::builder()
+                    .chat_id(ChatId::Integer(event.chat.id))
+                    .text(reply_text(&event.chat, &previous, true))
+                    .parse_mode(ParseMode::Html)
+                    .reply_parameters(reply)
+                    .build();
+                params.message_thread_id = event.trace.as_ref().and_then(Trace::thread_id);
+                for t in &traces {
+                    t.stage("album_reply");
+                }
+                let response = app.bot.send_message(&params).await?.result;
+                for t in &traces {
+                    t.reply(&response, event.message_id);
+                }
+            }
+            Ok(())
         }
-        if let Some((event, previous)) = best {
-            self.maybe_report(event.chat.id, previous.count).await;
-            self.reply(
-                event.chat.id,
-                event.message_id,
-                reply_text(&event.chat, &previous, true),
-                true,
-                None,
-            )
-            .await?;
+        .await;
+        for t in traces {
+            t.finish(
+                result
+                    .as_ref()
+                    .err()
+                    .map(|e| format!("{e:#}").replace(&self.config.token, "<REDACTED>")),
+            );
         }
-        Ok(())
+        result
     }
 
     async fn maybe_report(&self, group_id: i64, count: i64) {
+        self.stage("stat_report");
         if let Some(url) = &self.config.report_stat_url {
             let body = serde_json::json!({"group_id":group_id,"mars_count":count}).to_string();
             if let Err(e) = self
@@ -1159,10 +1330,16 @@ impl App {
             return Ok(());
         };
         if let Some(hash) = data.strip_prefix("wl:").and_then(parse_hash) {
+            if let Some(t) = &self.trace {
+                t.hash(&hash);
+            }
             self.db.set_image_whitelist(chat_id, hash, true).await?;
             self.answer_callback(&callback.id, "该图片已加入白名单")
                 .await?;
         } else if let Some(hash) = data.strip_prefix("find:").and_then(parse_hash) {
+            if let Some(t) = &self.trace {
+                t.hash(&hash);
+            }
             let found = self.db.similar(chat_id, hash).await?;
             let mut text = format!(
                 "火星车为您找到了{}张相似的图片\n这些图片的汉明距离小于6\n",
@@ -1185,6 +1362,7 @@ impl App {
     }
 
     async fn answer_callback(&self, id: &str, text: &str) -> Result<()> {
+        self.stage("answer_callback");
         self.bot
             .answer_callback_query(
                 &AnswerCallbackQueryParams::builder()
@@ -1270,6 +1448,7 @@ impl App {
                 return Ok(());
             }
         };
+        self.stage("send_document");
         let result = self
             .bot
             .send_document(
@@ -1279,7 +1458,11 @@ impl App {
                     .build(),
             )
             .await
-            .map(|_| ());
+            .map(|r| {
+                if let Some(t) = &self.trace {
+                    t.reply(&r.result, message_id);
+                }
+            });
         let _ = tokio::fs::remove_file(&path).await;
         if let Err(error) = result {
             self.export_locks
@@ -1325,6 +1508,7 @@ fn photo_reference(message: &Message) -> Option<PhotoEvent> {
         .or(message.reply_to_message.as_deref())?;
     let photo = source.photo.as_ref()?.last()?;
     Some(PhotoEvent {
+        trace: None,
         chat: (*message.chat).clone(),
         message_id: message.message_id,
         user_id: message.from.as_ref().map(|u| u.id),
@@ -1491,11 +1675,116 @@ fn main() -> Result<()> {
     runtime.block_on(run(config))
 }
 
+fn spawn_update(app: &App, alert_bot: &Bot, update: Update, received_ms: i64, received: Instant) {
+    let trace = match &update.content {
+        UpdateContent::Message(m) => Some(Trace::new(
+            update.update_id,
+            "message",
+            m,
+            false,
+            received_ms,
+            received,
+        )),
+        UpdateContent::EditedMessage(m) => Some(Trace::new(
+            update.update_id,
+            "edited_message",
+            m,
+            true,
+            received_ms,
+            received,
+        )),
+        UpdateContent::ChannelPost(m) => Some(Trace::new(
+            update.update_id,
+            "channel_post",
+            m,
+            false,
+            received_ms,
+            received,
+        )),
+        UpdateContent::EditedChannelPost(m) => Some(Trace::new(
+            update.update_id,
+            "edited_channel_post",
+            m,
+            true,
+            received_ms,
+            received,
+        )),
+        UpdateContent::CallbackQuery(q) => match q.message.as_ref() {
+            Some(MaybeInaccessibleMessage::Message(m)) => Some(Trace::new(
+                update.update_id,
+                "callback_query",
+                m,
+                false,
+                received_ms,
+                received,
+            )),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(t) = &trace {
+        // Telegram can deliver bot-authored messages; never turn our own alerts into new alerts.
+        let own_message = match &update.content {
+            UpdateContent::Message(m)
+            | UpdateContent::EditedMessage(m)
+            | UpdateContent::ChannelPost(m)
+            | UpdateContent::EditedChannelPost(m) => {
+                m.from.as_ref().is_some_and(|u| u.id == app.self_id)
+            }
+            _ => false,
+        };
+        if own_message {
+            t.suppress_alerts();
+        }
+        t.emit("message_received");
+        app.tasks.spawn(t.clone().monitor(
+            Some(alert_bot.clone()),
+            app.config.slow_message_alert_chat_id,
+            app.config.token.clone(),
+            app.tasks.clone(),
+        ));
+    }
+    let app = app.traced(trace.clone());
+    let tasks = app.tasks.clone();
+    let guard = trace.clone().map(CompletionGuard);
+    tasks.spawn(async move {
+        let _guard = guard;
+        if let Some(t) = &trace {
+            t.start();
+        }
+        let token = app.config.token.clone();
+        let operation_started = Instant::now();
+        let update_id = update.update_id;
+        let result = dispatch(app, update).await;
+        let error = result
+            .as_ref()
+            .err()
+            .map(|e| format!("{e:#}").replace(&token, "<REDACTED>"));
+        if let Some(t) = &trace {
+            if !t.deferred() || error.is_some() {
+                t.finish(error);
+            }
+        } else {
+            let record = serde_json::json!({
+                "event": "update_completed", "update_id": update_id,
+                "received_at_ms": received_ms,
+                "processing_total_ms": operation_started.elapsed().as_secs_f64() * 1000.0,
+                "error": error,
+            });
+            eprintln!("{record}");
+        }
+    });
+}
+
 async fn run(config: Config) -> Result<()> {
     let http = http_client(&config)?;
     let bot = Bot::builder()
         .api_url(config.api_url())
         .client(http.clone())
+        .build();
+    let alert_bot = Bot::builder()
+        .api_url(config.api_url())
+        .client(http_client_timeout(&config, Duration::from_secs(10))?)
         .build();
     let me = bot.get_me().await?.result;
     let db = Database::open(
@@ -1504,6 +1793,7 @@ async fn run(config: Config) -> Result<()> {
     )
     .await?;
     let app = App {
+        trace: None,
         bot,
         http,
         config,
@@ -1527,16 +1817,12 @@ async fn run(config: Config) -> Result<()> {
                 break;
             }
             response = app.bot.get_updates(&params) => match response {
-                Ok(result) => for update in result.result {
+                Ok(result) => {
+                    let received_ms=telemetry::now_ms(); let received=Instant::now();
+                    for update in result.result {
                     offset = Some(i64::from(update.update_id) + 1);
-                    let app = app.clone();
-                    let tasks = app.tasks.clone();
-                    tasks.spawn(async move {
-                        if let Err(e) = dispatch(app, update).await {
-                            eprintln!("update failed: {e:#}");
-                        }
-                    });
-                },
+                    spawn_update(&app, &alert_bot, update, received_ms, received);
+                }},
                 Err(e) => { eprintln!("getUpdates failed: {e}"); sleep(Duration::from_secs(2)).await; }
             }
         }

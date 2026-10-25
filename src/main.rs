@@ -960,41 +960,46 @@ impl App {
             return Ok(hash);
         }
         self.stage("get_file");
-        let remote = self
-            .bot
-            .get_file(
-                &GetFileParams::builder()
-                    .file_id(event.file_id.clone())
-                    .build(),
-            )
-            .await?
-            .result;
+        let remote = {
+            let _timer = self.trace.as_ref().map(|t| t.timer("get_file_ms"));
+            self.bot
+                .get_file(
+                    &GetFileParams::builder()
+                        .file_id(event.file_id.clone())
+                        .build(),
+                )
+                .await?
+                .result
+        };
         let path = remote
             .file_path
             .ok_or_else(|| anyhow!("getFile did not return file_path"))?;
         self.stage("file_download");
-        let bytes = if path.starts_with("http://") || path.starts_with("https://") {
-            self.http
-                .get(path)
-                .send()
-                .await?
-                .error_for_status()?
-                .bytes()
-                .await?
-                .to_vec()
-        } else if Path::new(&path).is_absolute() {
-            tokio::fs::read(&path)
-                .await
-                .with_context(|| format!("read local Bot API file {path}"))?
-        } else {
-            self.http
-                .get(self.config.file_url(&path))
-                .send()
-                .await?
-                .error_for_status()?
-                .bytes()
-                .await?
-                .to_vec()
+        let bytes = {
+            let _timer = self.trace.as_ref().map(|t| t.timer("file_download_ms"));
+            if path.starts_with("http://") || path.starts_with("https://") {
+                self.http
+                    .get(path)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .bytes()
+                    .await?
+                    .to_vec()
+            } else if Path::new(&path).is_absolute() {
+                tokio::fs::read(&path)
+                    .await
+                    .with_context(|| format!("read local Bot API file {path}"))?
+            } else {
+                self.http
+                    .get(self.config.file_url(&path))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .bytes()
+                    .await?
+                    .to_vec()
+            }
         };
         self.stage("dhash");
         let hash = spawn_blocking(move || dhash(bytes)).await??;

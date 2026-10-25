@@ -104,6 +104,8 @@ async fn album_cached_hashes_share_one_reply_and_finish_each_member() {
         assert_eq!(v["replies"].as_array().unwrap().len(), 1);
         assert_eq!(v["telegram_reply_at_ms"], 105000);
         assert!(v["db_execution_ms"].as_f64().unwrap() > 0.0);
+        assert_eq!(v["get_file_called"], false);
+        assert_eq!(v["get_file_ms"], 0.0);
     }
     server.join().unwrap();
     cleanup(app);
@@ -233,4 +235,52 @@ fn blocking_queue_wait_is_separate_from_execution() {
         drop(traced);
         cleanup(app);
     });
+}
+
+#[tokio::test]
+async fn get_file_timeout_path_records_api_wait_separately() {
+    let (url, rx, server) = crate::test_support::api_with_delays(vec![(
+        json!({"ok":false,"error_code":400,"description":"file unavailable"}),
+        Duration::from_millis(60),
+    )]);
+    let app = app(url).await;
+    let t = trace(41);
+    let traced = app.traced(Some(t.clone()));
+    assert!(traced.file_hash(&event(41, t.clone())).await.is_err());
+    let v = t.snapshot("test");
+    assert_eq!(v["stage"], "get_file");
+    assert_eq!(v["get_file_called"], true);
+    assert!(v["get_file_ms"].as_f64().unwrap() >= 50.0);
+    assert_eq!(v["file_download_ms"], 0.0);
+    assert!(v["db_execution_ms"].as_f64().unwrap() < v["get_file_ms"].as_f64().unwrap());
+    rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    server.join().unwrap();
+    drop(traced);
+    cleanup(app);
+}
+
+#[tokio::test]
+async fn successful_get_file_is_separate_from_local_file_read_failure() {
+    let missing = env::temp_dir().join(format!(
+        "mars-missing-image-{}-{}.jpg",
+        std::process::id(),
+        telemetry::now_ms()
+    ));
+    let (url, rx, server) = crate::test_support::api_with_delays(vec![(
+        json!({"ok":true,"result":{"file_id":"file42","file_unique_id":"unique42","file_path":missing}}),
+        Duration::from_millis(30),
+    )]);
+    let app = app(url).await;
+    let t = trace(42);
+    let traced = app.traced(Some(t.clone()));
+    assert!(traced.file_hash(&event(42, t.clone())).await.is_err());
+    let v = t.snapshot("test");
+    assert_eq!(v["stage"], "file_download");
+    assert_eq!(v["get_file_called"], true);
+    assert!(v["get_file_ms"].as_f64().unwrap() >= 20.0);
+    assert!(v["file_download_ms"].as_f64().unwrap() > 0.0);
+    rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    server.join().unwrap();
+    drop(traced);
+    cleanup(app);
 }

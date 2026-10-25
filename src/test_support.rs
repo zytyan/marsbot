@@ -15,12 +15,18 @@ pub(crate) fn message(id: i32, date: u64) -> frankenstein::types::Message {
 pub(crate) fn api(
     responses: Vec<Value>,
 ) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
+    api_with_delays(responses.into_iter().map(|r| (r, Duration::ZERO)).collect())
+}
+
+pub(crate) fn api_with_delays(
+    responses: Vec<(Value, Duration)>,
+) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}/botTEST", listener.local_addr().unwrap());
     let (tx, rx) = mpsc::channel();
     let task = thread::spawn(move || {
-        for response in responses {
+        for (response, delay) in responses {
             let until = std::time::Instant::now() + Duration::from_secs(8);
             let mut socket = loop {
                 match listener.accept() {
@@ -64,6 +70,7 @@ pub(crate) fn api(
             }
             let request = serde_json::from_slice(&bytes[header_end..header_end + length])
                 .unwrap_or(Value::Null);
+            thread::sleep(delay);
             let body = response.to_string();
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
             tx.send(request).unwrap();

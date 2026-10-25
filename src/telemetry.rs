@@ -96,13 +96,24 @@ pub(crate) fn format_alert(v: &Value) -> String {
         _ => "未知",
     };
     let metric = |key: &str| duration_label(v[key].as_f64().unwrap_or(0.0));
+    let get_file = match v["get_file_ms"].as_f64() {
+        None => "未记录（旧版日志）".into(),
+        Some(_) if v["get_file_called"] == false => "未调用".into(),
+        Some(ms) => duration_label(ms),
+    };
+    let file_download = v["file_download_ms"]
+        .as_f64()
+        .map(duration_label)
+        .unwrap_or_else(|| "未记录（旧版日志）".into());
     let mut text = format!(
-        "⚠️ 火星车 · 图片处理延迟\n\n当前延迟：{}\n状态：{}\n阶段：{}\n\n⏱ 耗时\n收取前等待：{}\n本机处理：{}\n数据库执行：{}\n数据库连接等待：{}\n数据库线程排队：{}\n\n🕒 时间\n消息：{}\n收取：{}\n回复：{}\n\n📍 消息定位\n群组 / 会话 ID：{}\n话题 ID：{}\n消息 ID：{}\n更新 ID：{}",
+        "⚠️ 火星车 · 图片处理延迟\n\n当前延迟：{}\n状态：{}\n阶段：{}\n\n⏱ 耗时\n收取前等待：{}\n处理总耗时（含外部等待）：{}\ngetFile API 等待：{}\n图片读取 / 下载：{}\n数据库执行：{}\n数据库连接等待：{}\n数据库线程排队：{}\n\n🕒 时间\n消息：{}\n收取：{}\n回复：{}\n\n📍 消息定位\n群组 / 会话 ID：{}\n话题 ID：{}\n消息 ID：{}\n更新 ID：{}",
         metric("response_latency_ms"),
         status,
         stage_label(v["stage"].as_str().unwrap_or("")),
         metric("receive_delay_ms"),
         metric("processing_total_ms"),
+        get_file,
+        file_download,
         metric("db_execution_ms"),
         metric("db_pool_wait_ms"),
         metric("db_blocking_queue_ms"),
@@ -418,7 +429,17 @@ impl Trace {
                 .map(|r| r["telegram_at_ms"].clone())
                 .unwrap_or(Value::Null),
         );
-        for name in ["db_pool_wait_ms", "db_blocking_queue_ms", "db_execution_ms"] {
+        o.insert(
+            "get_file_called".into(),
+            json!(metrics.contains_key("get_file_ms")),
+        );
+        for name in [
+            "db_pool_wait_ms",
+            "db_blocking_queue_ms",
+            "db_execution_ms",
+            "get_file_ms",
+            "file_download_ms",
+        ] {
             o.insert(
                 name.into(),
                 json!(metrics.get(name).copied().unwrap_or(0.0)),
@@ -574,6 +595,18 @@ mod tests {
         t.stage("get_file");
         let v = t.snapshot("slow_message_alert");
         let text = format_alert(&v);
+        assert!(text.contains("处理总耗时（含外部等待）"));
+        assert!(!text.contains("本机处理"));
+        assert!(text.contains("getFile API 等待：未调用"));
+        let get_file_timer = t.timer("get_file_ms");
+        std::thread::sleep(Duration::from_millis(12));
+        assert!(t.snapshot("test")["get_file_ms"].as_f64().unwrap() >= 10.0);
+        assert_eq!(t.snapshot("test")["get_file_called"], true);
+        drop(get_file_timer);
+        let mut legacy = v.clone();
+        legacy.as_object_mut().unwrap().remove("get_file_ms");
+        legacy.as_object_mut().unwrap().remove("file_download_ms");
+        assert!(format_alert(&legacy).contains("getFile API 等待：未记录（旧版日志）"));
         assert!(text.contains("1 分"));
         assert!(text.contains("getFile"));
         assert!(text.contains("回复：暂无"));

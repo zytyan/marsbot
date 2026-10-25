@@ -68,6 +68,8 @@ export BOT_API_URL="http://127.0.0.1:8081/bot"
 export BOT_FILE_URL="http://127.0.0.1:8081/file/bot"
 ```
 
+切换云端到本地服务时，先停止云端轮询，再按 [Telegram 的 logOut 流程](https://core.telegram.org/bots/api#logout) 从云端退出；退出后 10 分钟内不能重新登录云端。切换前检查本地历史积压，避免重复处理。当前版本识别 `BOT_API_URL` 和 `BOT_FILE_URL`，不识别旧的 `BOT_BASE_URL`。本地 API 返回的文件需要对运行 marsbot 的用户可读。
+
 当 `getFile` 返回 HTTP/HTTPS 地址时程序直接下载；返回绝对本地路径时直接读取该路径；返回相对路径时按 `BOT_FILE_URL` 下载。
 
 ## 功能
@@ -103,7 +105,9 @@ Release，并发布 `marsbot-0.1.0-linux-x86_64-glibc2.36.tar.gz` 及其 SHA-256
 
 - `receive_delay_ms`：Telegram 事件到本机收取的时间差。
 - `queue_ms`：收取到任务开始的等待时间。
-- `processing_total_ms`：收取到处理完成的总耗时，包含排队和相册等待，使用单调时钟。
+- `processing_total_ms`：收取到处理完成的总耗时，包含 API 等待、图片读取/下载、排队和相册等待，使用单调时钟；不是设备 CPU 运算耗时。
+- `get_file_ms`：`getFile` API 请求的累计等待耗时，包含在途请求的已等待时间，成功和失败都会计入；`get_file_called` 标识是否实际发起请求，缓存命中或尚未请求时为 `false`。
+- `file_download_ms`：取得文件路径后读取本地图片或下载文件的累计耗时，与 `get_file_ms` 分开记录。
 - `db_pool_wait_ms`：等待/创建 SQLite 连接的累计耗时。
 - `db_blocking_queue_ms`：取得连接后，数据库任务等待 blocking 线程的累计耗时。
 - `db_execution_ms`：数据库读写、结果读取和事务的累计执行时间，包含 SQLite 锁等待；导出的 CSV/ZIP 编码不计入其中。
@@ -119,6 +123,6 @@ Release，并发布 `marsbot-0.1.0-linux-x86_64-glibc2.36.tar.gz` 及其 SHA-256
 export SLOW_MESSAGE_ALERT_CHAT_ID=199456161
 ```
 
-接收者需要先与 Bot 建立私聊。私信仅针对包含普通图片或引用普通图片的消息；纯文字、文档、音视频和贴纸等无普通图片关联的消息仍保留 JSON 计时与慢日志，但不发送私信。私信使用中文分段排版，展示状态、阶段、易读耗时、UTC 时间、消息链接、定位 ID、file_id 和 dHash；尚无回复或哈希时显示说明文字。超过单条消息长度时分段发送。发送使用独立客户端（继承 Bot API 地址及代理配置）和最多 10 秒的总超时；成功记录 `slow_message_alert_sent`，失败记录 `slow_message_alert_failed`，不阻塞业务、不无限重试，也不把告警自身作为业务回复。关闭接收者配置只关闭私信，仍保留所有计时和慢日志。
+接收者需要先与 Bot 建立私聊。私信仅针对包含普通图片或引用普通图片的消息；纯文字、文档、音视频和贴纸等无普通图片关联的消息仍保留 JSON 计时与慢日志，但不发送私信。私信使用中文分段排版，展示状态、阶段、处理总耗时（含外部等待）、独立的 getFile API 等待和图片读取/下载耗时、UTC 时间、消息链接、定位 ID、file_id 和 dHash；尚无回复或哈希时显示说明文字；旧版日志没有 getFile 计时时明确显示“未记录”，不会把未知值当作零。超过单条消息长度时分段发送。发送使用独立客户端（继承 Bot API 地址及代理配置）和最多 10 秒的总超时；成功记录 `slow_message_alert_sent`，失败记录 `slow_message_alert_failed`，不阻塞业务、不无限重试，也不把告警自身作为业务回复。关闭接收者配置只关闭私信，仍保留所有计时和慢日志。
 
 测试全部使用 loopback 模拟 Telegram API，不向真实用户发送消息。

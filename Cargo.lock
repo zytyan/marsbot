@@ -163,6 +163,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "chrono"
+version = "0.4.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "clang"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -860,6 +869,7 @@ name = "marsbot"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "frankenstein",
  "opencv",
  "reqwest",

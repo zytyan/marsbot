@@ -38,10 +38,115 @@ fn alert_parts(text: &str) -> Vec<String> {
     parts
 }
 
+fn duration_label(ms: f64) -> String {
+    if ms < 1000.0 {
+        format!("{ms:.1} 毫秒")
+    } else if ms < 60_000.0 {
+        format!("{:.1} 秒", ms / 1000.0)
+    } else {
+        format!(
+            "{} 分 {:.1} 秒",
+            (ms / 60_000.0) as u64,
+            (ms % 60_000.0) / 1000.0
+        )
+    }
+}
+fn time_label(value: &Value) -> String {
+    value
+        .as_i64()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map(|v| v.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "暂无".into())
+}
+fn value_label(value: &Value) -> String {
+    match value {
+        Value::Null => "无".into(),
+        Value::String(v) => v.clone(),
+        v => v.to_string(),
+    }
+}
+fn stage_label(stage: &str) -> &str {
+    match stage {
+        "queued" => "等待任务开始",
+        "dispatch" => "消息分发",
+        "database" => "等待数据库连接",
+        "db_blocking_queue" => "等待数据库工作线程",
+        "db_execute" => "最近阶段：数据库操作",
+        "get_file" => "向 Telegram 获取图片文件信息（getFile）",
+        "file_download" => "读取或下载图片",
+        "dhash" => "计算图片 dHash",
+        "album_wait" => "等待相册处理",
+        "album_reply" => "发送相册回复",
+        "photo" => "处理图片",
+        "reply" => "发送回复",
+        "stat_report" => "上报统计信息",
+        "send_document" => "发送文件回复",
+        "answer_callback" => "响应按钮操作",
+        _ => stage,
+    }
+}
+
+pub(crate) fn format_alert(v: &Value) -> String {
+    let status = match v["status"].as_str().unwrap_or("") {
+        "pending" => "等待处理",
+        "processing" => "处理中",
+        "completed" => "处理完成",
+        "ignored" => "已忽略",
+        "failed" => "处理失败",
+        _ => "未知",
+    };
+    let metric = |key: &str| duration_label(v[key].as_f64().unwrap_or(0.0));
+    let mut text = format!(
+        "⚠️ 火星车 · 图片处理延迟\n\n当前延迟：{}\n状态：{}\n阶段：{}\n\n⏱ 耗时\n收取前等待：{}\n本机处理：{}\n数据库执行：{}\n数据库连接等待：{}\n数据库线程排队：{}\n\n🕒 时间\n消息：{}\n收取：{}\n回复：{}\n\n📍 消息定位\n群组 / 会话 ID：{}\n话题 ID：{}\n消息 ID：{}\n更新 ID：{}",
+        metric("response_latency_ms"),
+        status,
+        stage_label(v["stage"].as_str().unwrap_or("")),
+        metric("receive_delay_ms"),
+        metric("processing_total_ms"),
+        metric("db_execution_ms"),
+        metric("db_pool_wait_ms"),
+        metric("db_blocking_queue_ms"),
+        time_label(&v["telegram_message_at_ms"]),
+        time_label(&v["received_at_ms"]),
+        time_label(&v["telegram_reply_at_ms"]),
+        value_label(&v["chat_id"]),
+        value_label(&v["message_thread_id"]),
+        value_label(&v["message_id"]),
+        value_label(&v["update_id"])
+    );
+    if !v["telegram_edit_at_ms"].is_null() {
+        text.push_str(&format!(
+            "\n编辑时间：{}",
+            time_label(&v["telegram_edit_at_ms"])
+        ));
+    }
+    if !v["media_group_id"].is_null() {
+        text.push_str(&format!("\n相册 ID：{}", value_label(&v["media_group_id"])));
+    }
+    if let Some(link) = v["message_url"].as_str() {
+        text.push_str(&format!("\n查看原消息：{link}"));
+    }
+    text.push_str(&format!(
+        "\n\n🖼 图片信息\nfile_id：{}\ndHash：{}",
+        value_label(&v["file_id"]),
+        v["dhash"].as_str().unwrap_or("尚未取得")
+    ));
+    if let Some(id) = v["image_source_message_id"].as_i64()
+        && Some(id) != v["message_id"].as_i64()
+    {
+        text.push_str(&format!("\n引用图片消息 ID：{id}"));
+    }
+    if let Some(error) = v["error"].as_str() {
+        text.push_str(&format!("\n\n错误：{error}"));
+    }
+    text
+}
+
 #[derive(Clone)]
 pub(crate) struct Trace(Arc<Inner>);
 struct Inner {
     metadata: Value,
+    has_photo: bool,
     received: Instant,
     received_ms: i64,
     origin_ms: i64,
@@ -151,6 +256,7 @@ impl Trace {
             None
         };
         Self(Arc::new(Inner {
+            has_photo: photo.is_some(),
             metadata: json!({"update_id": update_id, "update_type": kind, "chat_id": chat_id,
                 "group_id": if chat_id < 0 {Some(chat_id)} else {None},
                 "message_thread_id": message.message_thread_id, "message_id": message.message_id,
@@ -356,12 +462,14 @@ impl Trace {
             }
             if alert {
                 self.emit("slow_message_alert");
-                if let (Some(bot), Some(chat_id)) = (bot.clone(), chat_id) {
+                if self.0.has_photo
+                    && let (Some(bot), Some(chat_id)) = (bot.clone(), chat_id)
+                {
                     let trace = self.clone();
                     let token = token.clone();
                     // Independent task: the observer and business processing never wait for the notification.
                     tasks.spawn(async move {
-                        let text = trace.snapshot("slow_message_alert").to_string();
+                        let text = format_alert(&trace.snapshot("slow_message_alert"));
                         let send = async {
                             for part in alert_parts(&text) {
                                 let params = SendMessageParams::builder()
@@ -446,6 +554,73 @@ mod tests {
             102000,
             Instant::now(),
         )
+    }
+    fn photo_message() -> Message {
+        let mut m = message(42, 100);
+        m.photo=Some(serde_json::from_value(json!([{"file_id":"photo-file","file_unique_id":"photo-unique","width":10,"height":10}])).unwrap());
+        m
+    }
+    #[test]
+    fn human_alert_preserves_location_and_handles_missing_reply_and_hash() {
+        let t = Trace::new(
+            10,
+            "message",
+            &photo_message(),
+            false,
+            161001,
+            Instant::now(),
+        );
+        t.start();
+        t.stage("get_file");
+        let v = t.snapshot("slow_message_alert");
+        let text = format_alert(&v);
+        assert!(text.contains("1 分"));
+        assert!(text.contains("getFile"));
+        assert!(text.contains("回复：暂无"));
+        assert!(text.contains("dHash：尚未取得"));
+        assert!(text.contains("1970-01-01 00:01:40 UTC"));
+        assert!(text.contains("https://t.me/c/1234567890/42"));
+        assert_eq!(v["event"], "slow_message_alert");
+        assert!(v["dhash"].is_null());
+        t.hash(&[0xab; 8]);
+        t.finish(Some("example failure".into()));
+        let text = format_alert(&t.snapshot("slow_message_alert"));
+        assert!(text.contains("处理失败"));
+        assert!(text.contains("abababababababab"));
+        assert!(text.contains("example failure"));
+    }
+    #[tokio::test]
+    async fn messages_without_photos_keep_json_logs_but_do_not_send_private_alerts() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let bot = Bot::builder()
+            .api_url(format!("http://{}/botTEST", listener.local_addr().unwrap()))
+            .client(reqwest::Client::new())
+            .build();
+        let mut doc = message(43, 100);
+        doc.document = Some(Box::new(
+            serde_json::from_value(json!({"file_id":"doc","file_unique_id":"doc-unique"})).unwrap(),
+        ));
+        for m in [message(42, 100), doc] {
+            let t = Trace::new(10, "message", &m, false, 161001, Instant::now());
+            t.finish(None);
+            let tasks = tokio_util::task::TaskTracker::new();
+            t.clone()
+                .monitor(
+                    Some(bot.clone()),
+                    Some(199456161),
+                    "TEST".into(),
+                    tasks.clone(),
+                )
+                .await;
+            tasks.close();
+            tasks.wait().await;
+            assert!(listener.accept().is_err());
+            assert_eq!(
+                t.snapshot("slow_message_alert")["event"],
+                "slow_message_alert"
+            );
+        }
     }
     fn complete_at(t: &Trace, at: i64) {
         let mut s = t.0.state.lock().unwrap();
@@ -585,7 +760,7 @@ mod tests {
         let t = Trace::new(
             10,
             "message",
-            &message(42, 100),
+            &photo_message(),
             false,
             161001,
             Instant::now(),
@@ -603,9 +778,12 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(request["chat_id"], 199456161);
-        let payload: Value = serde_json::from_str(request["text"].as_str().unwrap()).unwrap();
-        assert_eq!(payload["message_id"], 42);
-        assert_eq!(payload["message_thread_id"], 7);
+        let text = request["text"].as_str().unwrap();
+        assert!(text.starts_with("⚠️ 火星车 · 图片处理延迟"));
+        assert!(text.contains("消息 ID：42"));
+        assert!(text.contains("话题 ID：7"));
+        assert!(text.contains("file_id：photo-file"));
+        assert!(serde_json::from_str::<Value>(text).is_err());
         assert!(t.snapshot("test")["completed_at_ms"].is_null());
         t.finish(None);
         monitor.await.unwrap();
@@ -623,7 +801,14 @@ mod tests {
             .api_url(url)
             .client(reqwest::Client::new())
             .build();
-        let t = trace();
+        let t = Trace::new(
+            10,
+            "message",
+            &photo_message(),
+            false,
+            102000,
+            Instant::now(),
+        );
         complete_at(&t, 161001);
         let tasks = tokio_util::task::TaskTracker::new();
         t.clone()
